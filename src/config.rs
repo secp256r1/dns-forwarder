@@ -107,8 +107,7 @@ impl Config {
                         continue;
                     }
                     let reversed: String = s.chars().rev().collect();
-                    suffix_entries
-                        .push((Box::leak(reversed.into_bytes().into_boxed_slice()), ()));
+                    suffix_entries.push((Box::leak(reversed.into_bytes().into_boxed_slice()), ()));
                 }
             }
 
@@ -154,24 +153,24 @@ impl Config {
         if let Some(ref path) = config.local_domain {
             let full_path = base_dir.join(path);
             if full_path.exists() {
-            let content = fs::read_to_string(&full_path)
-                .with_context(|| format!("reading local domain file {}", full_path.display()))?;
-            for line in content.lines() {
-                let line = line.trim();
-                if line.is_empty() || line.starts_with('#') {
-                    continue;
+                let content = fs::read_to_string(&full_path).with_context(|| {
+                    format!("reading local domain file {}", full_path.display())
+                })?;
+                for line in content.lines() {
+                    let line = line.trim();
+                    if line.is_empty() || line.starts_with('#') {
+                        continue;
+                    }
+                    let (name, ip) = line
+                        .split_once('=')
+                        .map(|(a, b)| (a.trim(), b.trim()))
+                        .ok_or_else(|| anyhow!("invalid local domain line: '{}'", line))?;
+                    let ip: Ipv4Addr = ip
+                        .parse()
+                        .with_context(|| format!("invalid IP in local domain line: '{}'", line))?;
+                    let reversed: String = name.chars().rev().collect();
+                    local_entries.push((Box::leak(reversed.into_bytes().into_boxed_slice()), ip));
                 }
-                let (name, ip) = line
-                    .split_once('=')
-                    .map(|(a, b)| (a.trim(), b.trim()))
-                    .ok_or_else(|| anyhow!("invalid local domain line: '{}'", line))?;
-                let ip: Ipv4Addr = ip
-                    .parse()
-                    .with_context(|| format!("invalid IP in local domain line: '{}'", line))?;
-                let reversed: String = name.chars().rev().collect();
-                local_entries
-                    .push((Box::leak(reversed.into_bytes().into_boxed_slice()), ip));
-            }
             }
         }
         let local_domains = TrieHard::new(local_entries);
@@ -187,14 +186,13 @@ impl Config {
 }
 
 fn parse_dns_server_addr(s: &str) -> Result<SocketAddr> {
-    let (addr, port) = match s.split_once(':') {
-        Some((addr, port)) => (addr, port.parse()?),
-        None => (s, 53),
-    };
-
-    let addr: IpAddr = addr.parse()?;
-
-    Ok((addr, port).into())
+    Ok(match s.parse::<SocketAddr>() {
+        Ok(socket) => socket,
+        Err(_) => match s.parse::<IpAddr>() {
+            Ok(ip) => (ip, 53).into(),
+            Err(_) => bail!("invalid dns server addr"),
+        },
+    })
 }
 
 pub fn init(path: &Path) -> Result<()> {
