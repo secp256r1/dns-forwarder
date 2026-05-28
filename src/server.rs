@@ -7,7 +7,10 @@ use tracing::{debug, info, warn};
 use crate::{
     cache,
     config::{Config, NftSet, config},
-    dns::{Response, analyze_response, build_a_response, build_soa_response, parse_qname},
+    dns::{
+        Response, analyze_response, build_a_response, build_nxdomain_response, build_soa_response,
+        parse_qname,
+    },
 };
 
 pub async fn run() -> Result<()> {
@@ -45,7 +48,6 @@ async fn forward(query: &[u8]) -> Result<Vec<u8>> {
     }
 
     let qname = parse_qname(query)?;
-    debug!("new query {qname}");
 
     let config = config()?;
 
@@ -56,21 +58,24 @@ async fn forward(query: &[u8]) -> Result<Vec<u8>> {
         return build_a_response(query, &ip.octets());
     }
 
+    if config.blocklist.ancestor(&reversed_qname).is_some() {
+        debug!("private domain or blocklist match: {qname}");
+        return build_nxdomain_response(query);
+    }
+
     if config.cache.enabled {
         let key = query[2..].to_vec();
         match cache::get(&key) {
-            Some(cached) => {
-                debug!("query {qname} from cache");
-                Ok([&query[..2], &cached].concat())
-            }
-            None => query_upstreams(query, &reversed_qname, config, Some(key)).await,
+            Some(cached) => Ok([&query[..2], &cached].concat()),
+            None => query_upstreams(&qname, query, &reversed_qname, config, Some(key)).await,
         }
     } else {
-        query_upstreams(query, &reversed_qname, config, None).await
+        query_upstreams(&qname, query, &reversed_qname, config, None).await
     }
 }
 
 async fn query_upstreams(
+    qname: &str,
     query: &[u8],
     reversed_qname: &str,
     config: &Config,
@@ -83,8 +88,7 @@ async fn query_upstreams(
 
     let upstreams = rule.map(|i| &i.upstreams).unwrap_or(&config.upstream);
 
-    let r = forward_to_upstreams(query, upstreams).await?;
-    debug!("query from rule's upstream");
+    let r = forward_to_upstreams(qname, query, upstreams).await?;
 
     let info = analyze_response(&r)?;
 
@@ -97,8 +101,9 @@ async fn query_upstreams(
         (rule.as_ref().and_then(|i| i.nft_set.clone()), info)
         && !a_records.is_empty()
     {
+        let qname = qname.to_string();
         let records = a_records.clone();
-        tokio::task::spawn_blocking(move || add_to_nft_set(&set, &records)).await??;
+        tokio::task::spawn_blocking(move || add_to_nft_set(&qname, &set, &records)).await??;
     }
 
     if let Some(key) = key {
@@ -107,12 +112,16 @@ async fn query_upstreams(
     Ok(r)
 }
 
-async fn forward_to_upstreams(query: &[u8], upstreams: &[SocketAddr]) -> Result<Vec<u8>> {
+async fn forward_to_upstreams(
+    qname: &str,
+    query: &[u8],
+    upstreams: &[SocketAddr],
+) -> Result<Vec<u8>> {
     let upstream = fastrand::choice(upstreams).ok_or_else(|| anyhow!("invalid upstreams"))?;
 
     let socket = UdpSocket::bind("0.0.0.0:0").await?;
 
-    debug!("forwarding query ({} bytes) to {}", query.len(), upstream);
+    debug!("query {qname} from {upstream}");
     socket.send_to(query, upstream).await?;
 
     let mut buf = vec![0u8; 512];
@@ -124,18 +133,24 @@ async fn forward_to_upstreams(query: &[u8], upstreams: &[SocketAddr]) -> Result<
     {
         Ok(Ok((len, _addr))) => Ok(buf[..len].to_vec()),
         Ok(Err(e)) => {
-            bail!("upstream {} error: {}", upstream, e);
+            bail!("query {qname} from {upstream} error: {e}");
         }
         Err(_) => {
-            bail!("upstream {} timed out", upstream);
+            bail!("query {qname} from {upstream} timed out");
         }
     }
 }
 
 /// Add IP addresses to an nftables set.
 /// Executes `nft add element <family> <table> <set> { <ip1>, <ip2>, ... }`.
-fn add_to_nft_set(s: &NftSet, ips: &[String]) -> Result<()> {
-    let elements = ips.join(", ");
+fn add_to_nft_set(qname: &str, s: &NftSet, ips: &[String]) -> Result<()> {
+    let config = config()?;
+
+    let elements = ips
+        .iter()
+        .map(|ip| format!("{ip} timeout {}s", config.cache.ttl_seconds + 10))
+        .collect::<Vec<_>>()
+        .join(", ");
     let out = std::process::Command::new("nft")
         .arg("add")
         .arg("element")
@@ -146,7 +161,11 @@ fn add_to_nft_set(s: &NftSet, ips: &[String]) -> Result<()> {
         .output()?;
 
     if out.status.success() {
-        debug!("added {} IP(s) to nftables set '{}'", ips.len(), s.set);
+        debug!(
+            "added {} IP(s) of {qname} to nftables set '{}'",
+            ips.len(),
+            s.set
+        );
     } else {
         warn!(
             "nft add element '{}' failed: {}",

@@ -9,6 +9,8 @@ use anyhow::{Context, Result, anyhow, bail};
 use serde::Deserialize;
 use trie_hard::TrieHard;
 
+const PRIVATE_DOMAINS: &[&str] = &[".lan", ".local", ".home.arpa", ".corp", ".internal"];
+
 static CONFIG: OnceLock<Config> = OnceLock::new();
 
 #[derive(Deserialize, Clone)]
@@ -18,6 +20,7 @@ struct RawConfig {
     pub rules: Vec<RuleConfig>,
     pub cache: Option<CacheConfig>,
     pub local_domain: Option<PathBuf>,
+    pub blocklist: Option<PathBuf>,
 }
 
 #[derive(Deserialize, Clone)]
@@ -78,12 +81,14 @@ pub struct Config {
     pub rules: Vec<Rule>,
     pub cache: CacheConfig,
     pub local_domains: TrieHard<'static, Ipv4Addr>,
+    pub blocklist: TrieHard<'static, ()>,
 }
 
 impl Config {
     pub fn from_file(path: &Path) -> Result<Self> {
         let config = RawConfig::from_file(path)?;
         let base_dir = path.parent().unwrap_or(Path::new("."));
+
         let listen = parse_dns_server_addr(&config.listen)?;
         let mut upstream = Vec::new();
         for i in &config.upstream {
@@ -95,9 +100,9 @@ impl Config {
         }
 
         let mut rules = Vec::new();
-        for i in &config.rules {
+        for rule in &config.rules {
             let mut suffix_entries: Vec<(&'static [u8], ())> = Vec::new();
-            for path in &i.domain_files {
+            for path in &rule.domain_files {
                 let full_path = base_dir.join(path);
                 let content = fs::read_to_string(&full_path)
                     .with_context(|| format!("reading domain file {}", full_path.display()))?;
@@ -106,15 +111,14 @@ impl Config {
                     if s.is_empty() {
                         continue;
                     }
-                    let reversed: String = s.chars().rev().collect();
-                    suffix_entries.push((Box::leak(reversed.into_bytes().into_boxed_slice()), ()));
+                    suffix_entries.push((reversed_str(s), ()));
                 }
             }
 
             let suffix_trie = TrieHard::new(suffix_entries);
 
             let mut upstreams = Vec::new();
-            for i in &i.upstreams {
+            for i in &rule.upstreams {
                 upstreams.push(parse_dns_server_addr(i)?);
             }
 
@@ -122,7 +126,7 @@ impl Config {
                 bail!("at least one upstream is required in the config rule",);
             }
 
-            let nft_set = match &i.nft_set {
+            let nft_set = match &rule.nft_set {
                 Some(s) => {
                     let parts: Vec<&str> = s.split_whitespace().collect();
                     if parts.len() != 3 {
@@ -144,43 +148,57 @@ impl Config {
             rules.push(Rule {
                 suffix_trie,
                 upstreams,
-                block_aaaa: i.block_aaaa,
+                block_aaaa: rule.block_aaaa,
                 nft_set,
             });
         }
 
-        let mut local_entries: Vec<(&'static [u8], Ipv4Addr)> = Vec::new();
-        if let Some(ref path) = config.local_domain {
+        let mut local_domain: Vec<(&'static [u8], Ipv4Addr)> = Vec::new();
+        if let Some(path) = &config.local_domain {
             let full_path = base_dir.join(path);
-            if full_path.exists() {
-                let content = fs::read_to_string(&full_path).with_context(|| {
-                    format!("reading local domain file {}", full_path.display())
-                })?;
-                for line in content.lines() {
-                    let line = line.trim();
-                    if line.is_empty() || line.starts_with('#') {
-                        continue;
-                    }
-                    let (name, ip) = line
-                        .split_once('=')
-                        .map(|(a, b)| (a.trim(), b.trim()))
-                        .ok_or_else(|| anyhow!("invalid local domain line: '{}'", line))?;
-                    let ip: Ipv4Addr = ip
-                        .parse()
-                        .with_context(|| format!("invalid IP in local domain line: '{}'", line))?;
-                    let reversed: String = name.chars().rev().collect();
-                    local_entries.push((Box::leak(reversed.into_bytes().into_boxed_slice()), ip));
+            let content = fs::read_to_string(&full_path)
+                .with_context(|| format!("reading local domain file {}", full_path.display()))?;
+            for line in content.lines() {
+                let line = line.trim();
+                if line.is_empty() || line.starts_with('#') {
+                    continue;
                 }
+                let (name, ip) = line
+                    .split_once('=')
+                    .map(|(a, b)| (a.trim(), b.trim()))
+                    .ok_or_else(|| anyhow!("invalid local domain line: '{}'", line))?;
+                let ip: Ipv4Addr = ip
+                    .parse()
+                    .with_context(|| format!("invalid IP in local domain line: '{}'", line))?;
+                local_domain.push((reversed_str(name), ip));
             }
         }
-        let local_domains = TrieHard::new(local_entries);
+
+        let mut blocklist: Vec<(&'static [u8], ())> = Vec::new();
+        if let Some(path) = &config.blocklist {
+            let full_path = base_dir.join(path);
+            let content = fs::read_to_string(&full_path)
+                .with_context(|| format!("reading blocklist file {}", full_path.display()))?;
+            for line in content.lines() {
+                let line = line.trim();
+                if line.is_empty() || line.starts_with('#') {
+                    continue;
+                }
+                blocklist.push((reversed_str(line), ()));
+            }
+        }
+
+        for i in PRIVATE_DOMAINS {
+            blocklist.push((reversed_str(i), ()));
+        }
 
         Ok(Config {
             listen,
             upstream,
             rules,
             cache: config.cache.unwrap_or_default(),
-            local_domains,
+            local_domains: TrieHard::new(local_domain),
+            blocklist: TrieHard::new(blocklist),
         })
     }
 }
@@ -193,6 +211,11 @@ fn parse_dns_server_addr(s: &str) -> Result<SocketAddr> {
             Err(_) => bail!("invalid dns server addr"),
         },
     })
+}
+
+fn reversed_str(s: &str) -> &'static [u8] {
+    let reversed: String = s.chars().rev().collect();
+    Box::leak(reversed.into_bytes().into_boxed_slice())
 }
 
 pub fn init(path: &Path) -> Result<()> {
