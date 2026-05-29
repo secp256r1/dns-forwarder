@@ -1,4 +1,4 @@
-use tracing::info;
+use log::info;
 
 mod cache;
 mod config;
@@ -7,7 +7,7 @@ mod server;
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
-    tracing_subscriber::fmt::init();
+    env_logger::init();
 
     let config_path = std::env::args()
         .nth(1)
@@ -16,11 +16,7 @@ async fn main() -> anyhow::Result<()> {
 
     info!("loading config from {}", config_path.display());
     config::init(&config_path)?;
-
     let config = config::config()?;
-    if config.cache.enabled {
-        cache::init(config.cache.max_entries, config.cache.ttl_seconds);
-    }
-
+    cache::init(config.cache.max_entries).await;
     server::run().await
 }

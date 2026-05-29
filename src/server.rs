@@ -1,15 +1,15 @@
 use std::{net::SocketAddr, sync::Arc};
 
 use anyhow::{Result, anyhow, bail};
+use log::{debug, info, warn};
 use tokio::net::UdpSocket;
-use tracing::{debug, info, warn};
 
 use crate::{
     cache,
     config::{Config, NftSet, config},
     dns::{
         Response, analyze_response, build_a_response, build_nxdomain_response, build_soa_response,
-        parse_qname,
+        cap_response_ttl, parse_qname,
     },
 };
 
@@ -63,14 +63,15 @@ async fn forward(query: &[u8]) -> Result<Vec<u8>> {
         return build_nxdomain_response(query);
     }
 
-    if config.cache.enabled {
-        let key = query[2..].to_vec();
-        match cache::get(&key) {
-            Some(cached) => Ok([&query[..2], &cached].concat()),
-            None => query_upstreams(&qname, query, &reversed_qname, config, Some(key)).await,
+    let key = query[2..].to_vec();
+    match cache::get(&key).await {
+        Some((cached, remaining_ttl)) => {
+            let mut response = [&query[..2], &cached].concat();
+            debug!("cache {qname} ttl {remaining_ttl}");
+            cap_response_ttl(&mut response, remaining_ttl)?;
+            Ok(response)
         }
-    } else {
-        query_upstreams(&qname, query, &reversed_qname, config, None).await
+        None => query_upstreams(&qname, query, &reversed_qname, config, Some(key)).await,
     }
 }
 
@@ -90,7 +91,7 @@ async fn query_upstreams(
 
     let r = forward_to_upstreams(qname, query, upstreams).await?;
 
-    let info = analyze_response(&r)?;
+    let (info, min_ttl) = analyze_response(&r)?;
 
     if rule.map(|i| i.block_aaaa) == Some(true) && matches!(info, Response::Aaaa) {
         debug!("AAAA record detected, returning SOA response");
@@ -103,11 +104,12 @@ async fn query_upstreams(
     {
         let qname = qname.to_string();
         let records = a_records.clone();
-        tokio::task::spawn_blocking(move || add_to_nft_set(&qname, &set, &records)).await??;
+        tokio::task::spawn_blocking(move || add_to_nft_set(&qname, &set, &records, min_ttl * 2))
+            .await??;
     }
 
     if let Some(key) = key {
-        cache::insert(key, r[2..].to_vec());
+        cache::insert(key, r[2..].to_vec(), min_ttl).await;
     }
     Ok(r)
 }
@@ -143,12 +145,10 @@ async fn forward_to_upstreams(
 
 /// Add IP addresses to an nftables set.
 /// Executes `nft add element <family> <table> <set> { <ip1>, <ip2>, ... }`.
-fn add_to_nft_set(qname: &str, s: &NftSet, ips: &[String]) -> Result<()> {
-    let config = config()?;
-
+fn add_to_nft_set(qname: &str, s: &NftSet, ips: &[String], timeout_secs: u32) -> Result<()> {
     let elements = ips
         .iter()
-        .map(|ip| format!("{ip} timeout {}s", config.cache.ttl_seconds + 10))
+        .map(|ip| format!("{ip} timeout {timeout_secs}s"))
         .collect::<Vec<_>>()
         .join(", ");
     let out = std::process::Command::new("nft")

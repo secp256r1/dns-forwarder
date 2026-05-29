@@ -1,5 +1,7 @@
 use anyhow::{Result, bail};
 
+use crate::config::config;
+
 const DNS_TYPE_A: u16 = 1;
 const DNS_TYPE_AAAA: u16 = 28;
 const DNS_TYPE_SOA: u16 = 6;
@@ -70,7 +72,7 @@ fn skip_name(data: &[u8], mut offset: usize) -> Result<usize> {
     }
 }
 
-pub fn analyze_response(data: &[u8]) -> Result<Response> {
+pub fn analyze_response(data: &[u8]) -> Result<(Response, u32)> {
     if data.len() < 12 {
         bail!("response too short");
     }
@@ -84,13 +86,25 @@ pub fn analyze_response(data: &[u8]) -> Result<Response> {
         offset += 4;
     }
 
+    let config = config()?;
+
+    let mut min_ttl = config.cache.max_ttl as u32;
     let mut has_aaaa = false;
     let mut a_records = Vec::new();
     for _ in 0..ancount {
         offset = skip_name(data, offset)?;
         if offset + 10 > data.len() {
-            break;
+            bail!("answer record truncated");
         }
+
+        let ttl = u32::from_be_bytes([
+            data[offset + 4],
+            data[offset + 5],
+            data[offset + 6],
+            data[offset + 7],
+        ]);
+        min_ttl = min_ttl.min(ttl);
+
         let rtype = u16_be(data, offset);
         let rdlength = u16_be(data, offset + 8) as usize;
         let rdata_off = offset + 10;
@@ -116,11 +130,41 @@ pub fn analyze_response(data: &[u8]) -> Result<Response> {
         offset = rdata_off + rdlength;
     }
 
-    Ok(if has_aaaa {
-        Response::Aaaa
-    } else {
-        Response::A(a_records)
-    })
+    Ok((
+        if has_aaaa {
+            Response::Aaaa
+        } else {
+            Response::A(a_records)
+        },
+        min_ttl,
+    ))
+}
+
+pub fn cap_response_ttl(response: &mut [u8], max_ttl: u32) -> Result<()> {
+    if response.len() < 12 {
+        bail!("response too short");
+    }
+
+    let qdcount = u16_be(response, 4);
+    let ancount = u16_be(response, 6);
+
+    let mut offset = 12;
+    for _ in 0..qdcount {
+        offset = skip_name(response, offset)?;
+        offset += 4;
+    }
+
+    for _ in 0..ancount {
+        offset = skip_name(response, offset)?;
+        if offset + 10 > response.len() {
+            bail!("answer record truncated");
+        }
+        response[offset + 4..offset + 4 + 4].copy_from_slice(&max_ttl.to_be_bytes());
+        let rdlength = u16_be(response, offset + 8) as usize;
+        offset += 10 + rdlength;
+    }
+
+    Ok(())
 }
 
 pub fn build_nxdomain_response(query: &[u8]) -> Result<Vec<u8>> {

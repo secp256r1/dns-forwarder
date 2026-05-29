@@ -1,7 +1,7 @@
 use std::{
     fs,
     net::{IpAddr, Ipv4Addr, SocketAddr},
-    path::{Path, PathBuf},
+    path::Path,
     sync::OnceLock,
 };
 
@@ -19,13 +19,13 @@ struct RawConfig {
     pub upstream: Vec<String>,
     pub rules: Vec<RuleConfig>,
     pub cache: Option<CacheConfig>,
-    pub local_domain: Option<PathBuf>,
-    pub blocklist: Option<PathBuf>,
+    pub local_domain: Option<String>,
+    pub blocklist: Option<String>,
 }
 
 #[derive(Deserialize, Clone)]
 pub struct RuleConfig {
-    pub domain_files: Vec<PathBuf>,
+    pub domain_files: Vec<String>,
     pub upstreams: Vec<String>,
     #[serde(default)]
     pub block_aaaa: bool,
@@ -59,17 +59,15 @@ pub struct NftSet {
 
 #[derive(Deserialize, Clone)]
 pub struct CacheConfig {
-    pub enabled: bool,
     pub max_entries: usize,
-    pub ttl_seconds: u64,
+    pub max_ttl: u64,
 }
 
 impl Default for CacheConfig {
     fn default() -> Self {
         CacheConfig {
-            enabled: true,
-            max_entries: 10000,
-            ttl_seconds: 300,
+            max_entries: 100_000,
+            max_ttl: 3600,
         }
     }
 }
@@ -123,17 +121,14 @@ impl Config {
             }
 
             if upstreams.is_empty() {
-                bail!("at least one upstream is required in the config rule",);
+                bail!("at least one upstream is required in the config rule");
             }
 
             let nft_set = match &rule.nft_set {
                 Some(s) => {
                     let parts: Vec<&str> = s.split_whitespace().collect();
                     if parts.len() != 3 {
-                        bail!(
-                            "invalid nft_set '{}', expected format 'family table set'",
-                            s
-                        );
+                        bail!("invalid nft_set '{s}', expected format 'family table set'");
                     }
 
                     Some(NftSet {
@@ -166,10 +161,10 @@ impl Config {
                 let (name, ip) = line
                     .split_once('=')
                     .map(|(a, b)| (a.trim(), b.trim()))
-                    .ok_or_else(|| anyhow!("invalid local domain line: '{}'", line))?;
+                    .ok_or_else(|| anyhow!("invalid local domain line: '{line}'"))?;
                 let ip: Ipv4Addr = ip
                     .parse()
-                    .with_context(|| format!("invalid IP in local domain line: '{}'", line))?;
+                    .with_context(|| format!("invalid IP in local domain line: '{line}'"))?;
                 local_domain.push((reversed_str(name), ip));
             }
         }
