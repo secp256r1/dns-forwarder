@@ -1,10 +1,23 @@
-listen = "127.0.0.1:5354"
-upstream = ["8.8.8.8", "114.114.114.114"]
+listen = "[::]:53"
+default_server = ["192.168.1.1"]
+
+[[rules]]
+type = "local"
+domain_files = ["local.txt"]
+
+[[rules]]
+type = "block"
+domain_files = ["blocklist.txt"]
 
 [[rules]]
 name = "gfw"
-domain_files = ["domains/gfw.txt"]
-upstreams = ["192.0.0.1"]
-# upstreams = ["1.1.1.1", "192.0.0.1"]
+type = "forward"
+domain_files = ["gfw.txt"]
+upstreams = ["1.1.1.1"]
 block_aaaa = true
-nft_set = "inet fw xip"
+nft_set = "inet fw4 fq"
+
+[[rules]]
+type = "forward"
+domain_files = ["correct.txt"]
+upstreams = ["1.1.1.1"]
