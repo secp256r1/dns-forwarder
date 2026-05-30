@@ -41,6 +41,9 @@ pub enum RuleKind {
     },
     Block,
     Local,
+    Cname {
+        cname_list: Vec<String>,
+    },
 }
 
 impl RawConfig {
@@ -59,6 +62,13 @@ pub struct ForwardRule {
     pub upstreams: Vec<SocketAddr>,
     pub block_aaaa: bool,
     pub nft_set: Option<NftSet>,
+}
+
+#[derive(Clone)]
+pub struct CnameRule {
+    pub name: Option<String>,
+    pub suffix_trie: TrieHard<'static, ()>,
+    pub cname_targets: Vec<String>,
 }
 
 #[derive(Clone)]
@@ -89,6 +99,7 @@ pub struct Config {
     pub default_server: Vec<SocketAddr>,
     pub cache: CacheConfig,
     pub forward_rules: Vec<ForwardRule>,
+    pub cname_rules: Vec<CnameRule>,
     pub local_domains: TrieHard<'static, Ipv4Addr>,
     pub blocklist: TrieHard<'static, ()>,
 }
@@ -110,6 +121,7 @@ impl Config {
 
         let mut local_domain: Vec<(&'static [u8], Ipv4Addr)> = Vec::new();
         let mut blocklist: Vec<(&'static [u8], ())> = Vec::new();
+        let mut cname_rules = Vec::new();
         let mut forward_rules = Vec::new();
         for rule in &config.rules {
             let name = &rule.name;
@@ -170,6 +182,28 @@ impl Config {
                         nft_set,
                     });
                 }
+                RuleKind::Cname { cname_list } => {
+                    let mut suffix_entries: Vec<(&'static [u8], ())> = Vec::new();
+                    for path in &rule.domain_files {
+                        let full_path = base_dir.join(path);
+                        let content = fs::read_to_string(&full_path).with_context(|| {
+                            format!("reading {name:?} cname rule domain file {}", full_path.display())
+                        })?;
+                        for line in content.lines() {
+                            let s = line.trim();
+                            if s.is_empty() {
+                                continue;
+                            }
+                            suffix_entries.push((reversed_str(s), ()));
+                        }
+                    }
+
+                    cname_rules.push(CnameRule {
+                        name: rule.name.clone(),
+                        suffix_trie: TrieHard::new(suffix_entries),
+                        cname_targets: cname_list.clone(),
+                    });
+                }
                 RuleKind::Block => {
                     for f in &rule.domain_files {
                         let full_path = base_dir.join(f);
@@ -218,6 +252,7 @@ impl Config {
             listen,
             default_server,
             forward_rules,
+            cname_rules,
             cache: config.cache.unwrap_or_default(),
             local_domains: TrieHard::new(local_domain),
             blocklist: TrieHard::new(blocklist),

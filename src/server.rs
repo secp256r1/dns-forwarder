@@ -1,4 +1,4 @@
-use std::sync::Arc;
+use std::{net::SocketAddr, sync::Arc};
 
 use anyhow::{Result, anyhow, bail};
 use log::{debug, info, warn};
@@ -8,8 +8,8 @@ use crate::{
     cache,
     config::{NftSet, config},
     dns::{
-        Response, analyze_response, build_a_response, build_nxdomain_response, build_soa_response,
-        cap_response_ttl, parse_qname,
+        Response, analyze_response, build_a_response, build_nxdomain_response, build_query,
+        cap_response_ttl, parse_qname, parse_query_type_and_class,
     },
 };
 
@@ -28,7 +28,7 @@ pub async fn run() -> Result<()> {
         let socket = socket.clone();
 
         tokio::spawn(async move {
-            match forward(&query).await {
+            match query_handler(&query).await {
                 Ok(response) => {
                     if let Err(e) = socket.send_to(&response, client_addr).await {
                         warn!("failed to send response to {}: {}", client_addr, e);
@@ -42,7 +42,7 @@ pub async fn run() -> Result<()> {
     }
 }
 
-async fn forward(query: &[u8]) -> Result<Vec<u8>> {
+async fn query_handler(query: &[u8]) -> Result<Vec<u8>> {
     if query.len() < 12 {
         bail!("query too short");
     }
@@ -72,6 +72,32 @@ async fn forward(query: &[u8]) -> Result<Vec<u8>> {
             Ok(response)
         }
         None => {
+            // CNAME chasing — resolve target via default_server and return result
+            if let Some(cname_rule) = config
+                .cname_rules
+                .iter()
+                .find(|i| i.suffix_trie.ancestor(&reversed_qname).is_some())
+            {
+                let (qtype, qclass) = parse_query_type_and_class(query)?;
+                if qtype == 1 || qtype == 28 {
+                    let target = fastrand::choice(&cname_rule.cname_targets)
+                        .ok_or_else(|| anyhow!("empty cname_list"))?;
+                    debug!(
+                        "cname chase: {} -> {}, rule: {:?}",
+                        qname, target, cname_rule.name
+                    );
+
+                    let query_id = u16::from_be_bytes([query[0], query[1]]);
+                    let sub_query = build_query(target, qtype, qclass, query_id);
+                    let upstream = fastrand::choice(&config.default_server)
+                        .ok_or_else(|| anyhow!("no default server"))?;
+                    let r = query_from_upstream(target, &sub_query, upstream).await?;
+                    let (_, min_ttl) = analyze_response(&r)?;
+                    cache::insert(key, r[2..].to_vec(), min_ttl).await;
+                    return Ok(r);
+                }
+            }
+
             let rule = config
                 .forward_rules
                 .iter()
@@ -84,33 +110,12 @@ async fn forward(query: &[u8]) -> Result<Vec<u8>> {
             let upstreams = rule.map(|i| &i.upstreams).unwrap_or(&config.default_server);
             let upstream =
                 fastrand::choice(upstreams).ok_or_else(|| anyhow!("invalid upstreams"))?;
-
-            let socket = UdpSocket::bind("0.0.0.0:0").await?;
-
-            debug!("query {qname} from {upstream}");
-            socket.send_to(query, upstream).await?;
-
-            let mut buf = vec![0u8; 512];
-            let len = match tokio::time::timeout(
-                std::time::Duration::from_secs(5),
-                socket.recv_from(&mut buf),
-            )
-            .await
-            {
-                Ok(Ok((len, _))) => len,
-                Ok(Err(e)) => {
-                    bail!("query {qname} from {upstream} error: {e}");
-                }
-                Err(_) => {
-                    bail!("query {qname} from {upstream} timed out");
-                }
-            };
-
-            let (info, min_ttl) = analyze_response(&buf[..len])?;
+            let r = query_from_upstream(&qname, query, upstream).await?;
+            let (info, min_ttl) = analyze_response(&r)?;
 
             if rule.map(|i| i.block_aaaa) == Some(true) && matches!(info, Response::Aaaa) {
-                debug!("AAAA record detected, returning SOA response");
-                return build_soa_response(query);
+                debug!("AAAA record detected, returning NXDOMAIN response");
+                return build_nxdomain_response(query);
             }
 
             if let (Some(set), Response::A(a_records)) =
@@ -125,8 +130,30 @@ async fn forward(query: &[u8]) -> Result<Vec<u8>> {
                 .await??;
             }
 
-            cache::insert(key, buf[2..len].to_vec(), min_ttl).await;
-            Ok(buf[..len].to_vec())
+            cache::insert(key, r[2..].to_vec(), min_ttl).await;
+            Ok(r)
+        }
+    }
+}
+
+async fn query_from_upstream(qname: &str, query: &[u8], upstream: &SocketAddr) -> Result<Vec<u8>> {
+    let socket = UdpSocket::bind("0.0.0.0:0").await?;
+    debug!("query {qname} from {upstream}");
+    socket.send_to(query, upstream).await?;
+
+    let mut buf = vec![0u8; 512];
+    match tokio::time::timeout(
+        std::time::Duration::from_secs(5),
+        socket.recv_from(&mut buf),
+    )
+    .await
+    {
+        Ok(Ok((len, _))) => Ok(buf[..len].to_vec()),
+        Ok(Err(e)) => {
+            bail!("cname query {qname} from {upstream} error: {e}");
+        }
+        Err(_) => {
+            bail!("cname query {qname} from {upstream} timed out");
         }
     }
 }

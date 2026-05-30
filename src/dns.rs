@@ -4,7 +4,6 @@ use crate::config::config;
 
 const DNS_TYPE_A: u16 = 1;
 const DNS_TYPE_AAAA: u16 = 28;
-const DNS_TYPE_SOA: u16 = 6;
 const DNS_CLASS_IN: u16 = 1;
 
 /// Parse the first question's QNAME from a DNS query.
@@ -45,6 +44,50 @@ pub fn parse_qname(data: &[u8]) -> Result<String> {
     }
 
     Ok(labels.join("."))
+}
+
+/// Parse the QTYPE (query type) from a DNS query.
+/// Parse both QTYPE and QCLASS from a DNS query.
+pub fn parse_query_type_and_class(data: &[u8]) -> Result<(u16, u16)> {
+    if data.len() < 16 {
+        bail!("query too short");
+    }
+    let mut offset = 12;
+    offset = skip_name(data, offset)?;
+    if offset + 4 > data.len() {
+        bail!("query truncated");
+    }
+    Ok((u16_be(data, offset), u16_be(data, offset + 2)))
+}
+
+/// Build a DNS query packet for the given target domain, QTYPE and QCLASS.
+pub fn build_query(target: &str, qtype: u16, qclass: u16, query_id: u16) -> Vec<u8> {
+    let qname = encode_domain_to_labels(target);
+    let mut buf = Vec::with_capacity(12 + qname.len() + 4);
+    buf.extend_from_slice(&query_id.to_be_bytes());
+    buf.push(0x01); // QR=0, RD=1
+    buf.push(0x00);
+    buf.extend_from_slice(&[0x00, 0x01]); // QDCOUNT=1
+    buf.extend_from_slice(&[0x00, 0x00]);
+    buf.extend_from_slice(&[0x00, 0x00]);
+    buf.extend_from_slice(&[0x00, 0x00]);
+    buf.extend_from_slice(&qname);
+    buf.extend_from_slice(&qtype.to_be_bytes());
+    buf.extend_from_slice(&qclass.to_be_bytes());
+    buf
+}
+
+fn encode_domain_to_labels(domain: &str) -> Vec<u8> {
+    let mut encoded = Vec::new();
+    for label in domain.split('.') {
+        if label.is_empty() {
+            continue;
+        }
+        encoded.push(label.len() as u8);
+        encoded.extend_from_slice(label.as_bytes());
+    }
+    encoded.push(0x00);
+    encoded
 }
 
 pub enum Response {
@@ -238,61 +281,6 @@ pub fn build_a_response(query: &[u8], ip: &[u8; 4]) -> Result<Vec<u8>> {
     resp.extend_from_slice(&[0x00, 0x00, 0x00, 0x3C]);
     resp.extend_from_slice(&[0x00, 0x04]);
     resp.extend_from_slice(ip);
-
-    Ok(resp)
-}
-
-pub fn build_soa_response(query: &[u8]) -> Result<Vec<u8>> {
-    if query.len() < 12 {
-        bail!("query too short");
-    }
-
-    let qdcount = u16_be(query, 4);
-    let mut offset = 12;
-    for _ in 0..qdcount {
-        offset = skip_name(query, offset)?;
-        offset += 4;
-    }
-    let question = &query[12..offset];
-
-    const MNAME: &[u8] = b"\x02ns\x05local\x00";
-    const RNAME: &[u8] = b"\x05admin\x02ns\x05local\x00";
-    const SOA_VALUES: &[u8] = &[
-        0x78, 0x96, 0xE5, 0x65, // SERIAL  = 2024010101
-        0x00, 0x00, 0x0E, 0x10, // REFRESH = 3600
-        0x00, 0x00, 0x03, 0x84, // RETRY   = 900
-        0x00, 0x01, 0x51, 0x80, // EXPIRE  = 86400
-        0x00, 0x00, 0x00, 0x3C, // MINIMUM = 60
-    ];
-
-    let soa_rdata_len = MNAME.len() + RNAME.len() + SOA_VALUES.len();
-    let soa_rr_len = 2 + 2 + 2 + 4 + 2 + soa_rdata_len;
-    let total = 12 + question.len() + soa_rr_len;
-
-    let mut resp = Vec::with_capacity(total);
-
-    resp.extend_from_slice(&query[..2]);
-
-    let rd_bit = query[2] & 0x01;
-    resp.push(0x80 | rd_bit);
-    resp.push(0x00);
-
-    resp.extend_from_slice(&[0x00, qdcount as u8]);
-    resp.extend_from_slice(&[0x00, 0x00]);
-    resp.extend_from_slice(&[0x00, 0x01]);
-    resp.extend_from_slice(&[0x00, 0x00]);
-
-    resp.extend_from_slice(question);
-
-    resp.push(0xC0);
-    resp.push(0x0C);
-    resp.extend_from_slice(&[0x00, DNS_TYPE_SOA as u8]);
-    resp.extend_from_slice(&[0x00, DNS_CLASS_IN as u8]);
-    resp.extend_from_slice(&[0x00, 0x00, 0x00, 0x3C]);
-    resp.extend_from_slice(&[(soa_rdata_len >> 8) as u8, soa_rdata_len as u8]);
-    resp.extend_from_slice(MNAME);
-    resp.extend_from_slice(RNAME);
-    resp.extend_from_slice(SOA_VALUES);
 
     Ok(resp)
 }
