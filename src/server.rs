@@ -1,4 +1,4 @@
-use std::{net::SocketAddr, sync::Arc};
+use std::sync::Arc;
 
 use anyhow::{Result, anyhow, bail};
 use log::{debug, info, warn};
@@ -6,7 +6,7 @@ use tokio::net::UdpSocket;
 
 use crate::{
     cache,
-    config::{Config, NftSet, config},
+    config::{NftSet, config},
     dns::{
         Response, analyze_response, build_a_response, build_nxdomain_response, build_soa_response,
         cap_response_ttl, parse_qname,
@@ -71,74 +71,62 @@ async fn forward(query: &[u8]) -> Result<Vec<u8>> {
             cap_response_ttl(&mut response, remaining_ttl)?;
             Ok(response)
         }
-        None => query_upstreams(&qname, query, &reversed_qname, config, Some(key)).await,
-    }
-}
+        None => {
+            let rule = config
+                .forward_rules
+                .iter()
+                .find(|i| i.suffix_trie.ancestor(&reversed_qname).is_some());
 
-async fn query_upstreams(
-    qname: &str,
-    query: &[u8],
-    reversed_qname: &str,
-    config: &Config,
-    key: Option<Vec<u8>>,
-) -> Result<Vec<u8>> {
-    let rule = config
-        .rules
-        .iter()
-        .find(|i| i.suffix_trie.ancestor(reversed_qname).is_some());
+            if let Some(rule) = &rule {
+                debug!("match rule {:?}", rule.name);
+            }
 
-    let upstreams = rule.map(|i| &i.upstreams).unwrap_or(&config.upstream);
+            let upstreams = rule.map(|i| &i.upstreams).unwrap_or(&config.default_server);
+            let upstream =
+                fastrand::choice(upstreams).ok_or_else(|| anyhow!("invalid upstreams"))?;
 
-    let r = forward_to_upstreams(qname, query, upstreams).await?;
+            let socket = UdpSocket::bind("0.0.0.0:0").await?;
 
-    let (info, min_ttl) = analyze_response(&r)?;
+            debug!("query {qname} from {upstream}");
+            socket.send_to(query, upstream).await?;
 
-    if rule.map(|i| i.block_aaaa) == Some(true) && matches!(info, Response::Aaaa) {
-        debug!("AAAA record detected, returning SOA response");
-        return build_soa_response(query);
-    }
+            let mut buf = vec![0u8; 512];
+            let len = match tokio::time::timeout(
+                std::time::Duration::from_secs(5),
+                socket.recv_from(&mut buf),
+            )
+            .await
+            {
+                Ok(Ok((len, _))) => len,
+                Ok(Err(e)) => {
+                    bail!("query {qname} from {upstream} error: {e}");
+                }
+                Err(_) => {
+                    bail!("query {qname} from {upstream} timed out");
+                }
+            };
 
-    if let (Some(set), Response::A(a_records)) =
-        (rule.as_ref().and_then(|i| i.nft_set.clone()), info)
-        && !a_records.is_empty()
-    {
-        let qname = qname.to_string();
-        let records = a_records.clone();
-        tokio::task::spawn_blocking(move || add_to_nft_set(&qname, &set, &records, min_ttl * 2))
-            .await??;
-    }
+            let (info, min_ttl) = analyze_response(&buf[..len])?;
 
-    if let Some(key) = key {
-        cache::insert(key, r[2..].to_vec(), min_ttl).await;
-    }
-    Ok(r)
-}
+            if rule.map(|i| i.block_aaaa) == Some(true) && matches!(info, Response::Aaaa) {
+                debug!("AAAA record detected, returning SOA response");
+                return build_soa_response(query);
+            }
 
-async fn forward_to_upstreams(
-    qname: &str,
-    query: &[u8],
-    upstreams: &[SocketAddr],
-) -> Result<Vec<u8>> {
-    let upstream = fastrand::choice(upstreams).ok_or_else(|| anyhow!("invalid upstreams"))?;
+            if let (Some(set), Response::A(a_records)) =
+                (rule.as_ref().and_then(|i| i.nft_set.clone()), info)
+                && !a_records.is_empty()
+            {
+                let qname = qname.to_string();
+                let records = a_records.clone();
+                tokio::task::spawn_blocking(move || {
+                    add_to_nft_set(&qname, &set, &records, min_ttl * 2)
+                })
+                .await??;
+            }
 
-    let socket = UdpSocket::bind("0.0.0.0:0").await?;
-
-    debug!("query {qname} from {upstream}");
-    socket.send_to(query, upstream).await?;
-
-    let mut buf = vec![0u8; 512];
-    match tokio::time::timeout(
-        std::time::Duration::from_secs(5),
-        socket.recv_from(&mut buf),
-    )
-    .await
-    {
-        Ok(Ok((len, _addr))) => Ok(buf[..len].to_vec()),
-        Ok(Err(e)) => {
-            bail!("query {qname} from {upstream} error: {e}");
-        }
-        Err(_) => {
-            bail!("query {qname} from {upstream} timed out");
+            cache::insert(key, buf[2..len].to_vec(), min_ttl).await;
+            Ok(buf[..len].to_vec())
         }
     }
 }
