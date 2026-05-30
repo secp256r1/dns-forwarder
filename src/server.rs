@@ -51,7 +51,7 @@ async fn query_handler(query: &[u8]) -> Result<Vec<u8>> {
 
     let config = config()?;
 
-    let reversed_qname: String = qname.chars().rev().collect();
+    let reversed_qname = qname.split('.').rev().collect::<Vec<_>>().join(".");
 
     if let Some((_, ip)) = config.local_domains.ancestor(&reversed_qname) {
         debug!("local domain match: {} -> {}", qname, ip);
@@ -89,9 +89,7 @@ async fn query_handler(query: &[u8]) -> Result<Vec<u8>> {
 
                     let query_id = u16::from_be_bytes([query[0], query[1]]);
                     let sub_query = build_query(target, qtype, qclass, query_id);
-                    let upstream = fastrand::choice(&config.default_server)
-                        .ok_or_else(|| anyhow!("no default server"))?;
-                    let r = query_from_upstream(target, &sub_query, upstream).await?;
+                    let r = query_from_upstream(target, &sub_query, &config.default_server).await?;
                     let (_, min_ttl) = analyze_response(&r)?;
                     cache::insert(key, r[2..].to_vec(), min_ttl).await;
                     return Ok(r);
@@ -107,16 +105,15 @@ async fn query_handler(query: &[u8]) -> Result<Vec<u8>> {
                 debug!("match rule {:?}", rule.name);
             }
 
-            let upstreams = rule.map(|i| &i.upstreams).unwrap_or(&config.default_server);
-            let upstream =
-                fastrand::choice(upstreams).ok_or_else(|| anyhow!("invalid upstreams"))?;
-            let r = query_from_upstream(&qname, query, upstream).await?;
-            let (info, min_ttl) = analyze_response(&r)?;
-
-            if rule.map(|i| i.block_aaaa) == Some(true) && matches!(info, Response::Aaaa) {
+            let (qtype, _) = parse_query_type_and_class(query)?;
+            if qtype == 28 && rule.map(|i| i.block_aaaa) == Some(true) {
                 debug!("AAAA record detected, returning NXDOMAIN response");
                 return build_nxdomain_response(query);
             }
+
+            let upstreams = rule.map(|i| &i.upstreams).unwrap_or(&config.default_server);
+            let r = query_from_upstream(&qname, query, upstreams).await?;
+            let (info, min_ttl) = analyze_response(&r)?;
 
             if let (Some(set), Response::A(a_records)) =
                 (rule.as_ref().and_then(|i| i.nft_set.clone()), info)
@@ -136,8 +133,13 @@ async fn query_handler(query: &[u8]) -> Result<Vec<u8>> {
     }
 }
 
-async fn query_from_upstream(qname: &str, query: &[u8], upstream: &SocketAddr) -> Result<Vec<u8>> {
+async fn query_from_upstream(
+    qname: &str,
+    query: &[u8],
+    upstreams: &[SocketAddr],
+) -> Result<Vec<u8>> {
     let socket = UdpSocket::bind("0.0.0.0:0").await?;
+    let upstream = fastrand::choice(upstreams).ok_or_else(|| anyhow!("invalid upstreams"))?;
     debug!("query {qname} from {upstream}");
     socket.send_to(query, upstream).await?;
 

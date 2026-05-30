@@ -119,10 +119,11 @@ impl Config {
             bail!("at least one upstream is required in the config");
         }
 
-        let mut local_domain: Vec<(&'static [u8], Ipv4Addr)> = Vec::new();
-        let mut blocklist: Vec<(&'static [u8], ())> = Vec::new();
+        let mut local_domain = Vec::new();
+        let mut blocklist = Vec::new();
         let mut cname_rules = Vec::new();
         let mut forward_rules = Vec::new();
+
         for rule in &config.rules {
             let name = &rule.name;
 
@@ -132,22 +133,13 @@ impl Config {
                     block_aaaa,
                     nft_set,
                 } => {
-                    let mut suffix_entries: Vec<(&'static [u8], ())> = Vec::new();
+                    let mut suffix_trie = Vec::new();
                     for path in &rule.domain_files {
-                        let full_path = base_dir.join(path);
-                        let content = fs::read_to_string(&full_path).with_context(|| {
-                            format!("reading {name:?} rule domain file {}", full_path.display())
-                        })?;
-                        for line in content.lines() {
-                            let s = line.trim();
-                            if s.is_empty() {
-                                continue;
-                            }
-                            suffix_entries.push((reversed_str(s), ()));
+                        for domain in read_domain_file(&base_dir.join(path))? {
+                            suffix_trie.push((domain, ()));
                         }
                     }
-
-                    let suffix_trie = TrieHard::new(suffix_entries);
+                    let suffix_trie = TrieHard::new(suffix_trie);
 
                     let mut upstreams = Vec::new();
                     for i in rule_upstreams {
@@ -183,39 +175,23 @@ impl Config {
                     });
                 }
                 RuleKind::Cname { cname_list } => {
-                    let mut suffix_entries: Vec<(&'static [u8], ())> = Vec::new();
+                    let mut suffix_trie = Vec::new();
                     for path in &rule.domain_files {
-                        let full_path = base_dir.join(path);
-                        let content = fs::read_to_string(&full_path).with_context(|| {
-                            format!("reading {name:?} cname rule domain file {}", full_path.display())
-                        })?;
-                        for line in content.lines() {
-                            let s = line.trim();
-                            if s.is_empty() {
-                                continue;
-                            }
-                            suffix_entries.push((reversed_str(s), ()));
+                        for domain in read_domain_file(&base_dir.join(path))? {
+                            suffix_trie.push((domain, ()));
                         }
                     }
 
                     cname_rules.push(CnameRule {
                         name: rule.name.clone(),
-                        suffix_trie: TrieHard::new(suffix_entries),
+                        suffix_trie: TrieHard::new(suffix_trie),
                         cname_targets: cname_list.clone(),
                     });
                 }
                 RuleKind::Block => {
-                    for f in &rule.domain_files {
-                        let full_path = base_dir.join(f);
-                        let content = fs::read_to_string(&full_path).with_context(|| {
-                            format!("reading blocklist file {}", full_path.display())
-                        })?;
-                        for line in content.lines() {
-                            let line = line.trim();
-                            if line.is_empty() || line.starts_with('#') {
-                                continue;
-                            }
-                            blocklist.push((reversed_str(line), ()));
+                    for path in &rule.domain_files {
+                        for domain in read_domain_file(&base_dir.join(path))? {
+                            blocklist.push((domain, ()));
                         }
                     }
                 }
@@ -237,7 +213,7 @@ impl Config {
                             let ip: Ipv4Addr = ip.parse().with_context(|| {
                                 format!("invalid IP in local domain line: '{line}'")
                             })?;
-                            local_domain.push((reversed_str(name), ip));
+                            local_domain.push((reversed_domain(name), ip));
                         }
                     }
                 }
@@ -245,7 +221,7 @@ impl Config {
         }
 
         for i in PRIVATE_DOMAINS {
-            blocklist.push((reversed_str(i), ()));
+            blocklist.push((reversed_domain(i), ()));
         }
 
         Ok(Config {
@@ -270,9 +246,24 @@ fn parse_dns_server_addr(s: &str) -> Result<SocketAddr> {
     })
 }
 
-fn reversed_str(s: &str) -> &'static [u8] {
-    let reversed: String = s.chars().rev().collect();
+fn reversed_domain(s: &str) -> &'static [u8] {
+    let reversed = s.split('.').rev().collect::<Vec<_>>().join(".");
     Box::leak(reversed.into_bytes().into_boxed_slice())
+}
+
+fn read_domain_file(path: &Path) -> Result<Vec<&'static [u8]>> {
+    let content = fs::read_to_string(path)
+        .with_context(|| format!("reading domain file {}", path.display()))?;
+    let mut result = Vec::new();
+    for line in content.lines() {
+        let line = line.trim();
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+        result.push(reversed_domain(line));
+    }
+
+    Ok(result)
 }
 
 pub fn init(path: &Path) -> Result<()> {
