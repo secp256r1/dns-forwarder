@@ -4,6 +4,7 @@ mod cache;
 mod config;
 mod dns;
 mod server;
+mod trie;
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {

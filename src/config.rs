@@ -7,7 +7,8 @@ use std::{
 
 use anyhow::{Context, Result, anyhow, bail};
 use serde::Deserialize;
-use trie_hard::TrieHard;
+
+use crate::trie::DomainTrie;
 
 const PRIVATE_DOMAINS: &[&str] = &[".lan", ".local", ".home.arpa", ".corp", ".internal"];
 
@@ -58,7 +59,7 @@ impl RawConfig {
 #[derive(Clone)]
 pub struct ForwardRule {
     pub name: Option<String>,
-    pub suffix_trie: TrieHard<'static, ()>,
+    pub suffix_trie: DomainTrie<()>,
     pub upstreams: Vec<SocketAddr>,
     pub block_aaaa: bool,
     pub nft_set: Option<NftSet>,
@@ -67,7 +68,7 @@ pub struct ForwardRule {
 #[derive(Clone)]
 pub struct CnameRule {
     pub name: Option<String>,
-    pub suffix_trie: TrieHard<'static, ()>,
+    pub suffix_trie: DomainTrie<()>,
     pub cname_targets: Vec<String>,
 }
 
@@ -100,8 +101,8 @@ pub struct Config {
     pub cache: CacheConfig,
     pub forward_rules: Vec<ForwardRule>,
     pub cname_rules: Vec<CnameRule>,
-    pub local_domains: TrieHard<'static, Ipv4Addr>,
-    pub blocklist: TrieHard<'static, ()>,
+    pub local_domains: DomainTrie<Ipv4Addr>,
+    pub blocklist: DomainTrie<()>,
 }
 
 impl Config {
@@ -119,8 +120,8 @@ impl Config {
             bail!("at least one upstream is required in the config");
         }
 
-        let mut local_domain = Vec::new();
-        let mut blocklist = Vec::new();
+        let mut local_domains = DomainTrie::new();
+        let mut blocklist = DomainTrie::new();
         let mut cname_rules = Vec::new();
         let mut forward_rules = Vec::new();
 
@@ -133,13 +134,12 @@ impl Config {
                     block_aaaa,
                     nft_set,
                 } => {
-                    let mut suffix_trie = Vec::new();
+                    let mut suffix_trie = DomainTrie::new();
                     for path in &rule.domain_files {
                         for domain in read_domain_file(&base_dir.join(path))? {
-                            suffix_trie.push((domain, ()));
+                            suffix_trie.insert(&domain, ());
                         }
                     }
-                    let suffix_trie = TrieHard::new(suffix_trie);
 
                     let mut upstreams = Vec::new();
                     for i in rule_upstreams {
@@ -175,23 +175,23 @@ impl Config {
                     });
                 }
                 RuleKind::Cname { cname_list } => {
-                    let mut suffix_trie = Vec::new();
+                    let mut suffix_trie = DomainTrie::new();
                     for path in &rule.domain_files {
                         for domain in read_domain_file(&base_dir.join(path))? {
-                            suffix_trie.push((domain, ()));
+                            suffix_trie.insert(&domain, ());
                         }
                     }
 
                     cname_rules.push(CnameRule {
                         name: rule.name.clone(),
-                        suffix_trie: TrieHard::new(suffix_trie),
+                        suffix_trie,
                         cname_targets: cname_list.clone(),
                     });
                 }
                 RuleKind::Block => {
                     for path in &rule.domain_files {
                         for domain in read_domain_file(&base_dir.join(path))? {
-                            blocklist.push((domain, ()));
+                            blocklist.insert(&domain, ());
                         }
                     }
                 }
@@ -213,7 +213,7 @@ impl Config {
                             let ip: Ipv4Addr = ip.parse().with_context(|| {
                                 format!("invalid IP in local domain line: '{line}'")
                             })?;
-                            local_domain.push((reversed_domain(name), ip));
+                            local_domains.insert(name, ip);
                         }
                     }
                 }
@@ -221,7 +221,7 @@ impl Config {
         }
 
         for i in PRIVATE_DOMAINS {
-            blocklist.push((reversed_domain(i), ()));
+            blocklist.insert(i, ());
         }
 
         Ok(Config {
@@ -230,8 +230,8 @@ impl Config {
             forward_rules,
             cname_rules,
             cache: config.cache.unwrap_or_default(),
-            local_domains: TrieHard::new(local_domain),
-            blocklist: TrieHard::new(blocklist),
+            local_domains,
+            blocklist,
         })
     }
 }
@@ -246,12 +246,7 @@ fn parse_dns_server_addr(s: &str) -> Result<SocketAddr> {
     })
 }
 
-fn reversed_domain(s: &str) -> &'static [u8] {
-    let reversed = s.split('.').rev().collect::<Vec<_>>().join(".");
-    Box::leak(reversed.into_bytes().into_boxed_slice())
-}
-
-fn read_domain_file(path: &Path) -> Result<Vec<&'static [u8]>> {
+fn read_domain_file(path: &Path) -> Result<Vec<String>> {
     let content = fs::read_to_string(path)
         .with_context(|| format!("reading domain file {}", path.display()))?;
     let mut result = Vec::new();
@@ -260,7 +255,7 @@ fn read_domain_file(path: &Path) -> Result<Vec<&'static [u8]>> {
         if line.is_empty() || line.starts_with('#') {
             continue;
         }
-        result.push(reversed_domain(line));
+        result.push(line.to_string());
     }
 
     Ok(result)

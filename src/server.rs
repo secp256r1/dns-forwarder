@@ -51,14 +51,12 @@ async fn query_handler(query: &[u8]) -> Result<Vec<u8>> {
 
     let config = config()?;
 
-    let reversed_qname = qname.split('.').rev().collect::<Vec<_>>().join(".");
-
-    if let Some((_, ip)) = config.local_domains.ancestor(&reversed_qname) {
+    if let Some(ip) = config.local_domains.get(&qname) {
         debug!("local domain match: {} -> {}", qname, ip);
         return build_a_response(query, &ip.octets());
     }
 
-    if config.blocklist.ancestor(&reversed_qname).is_some() {
+    if config.blocklist.get(&qname).is_some() {
         debug!("private domain or blocklist match: {qname}");
         return build_nxdomain_response(query);
     }
@@ -76,7 +74,7 @@ async fn query_handler(query: &[u8]) -> Result<Vec<u8>> {
             if let Some(cname_rule) = config
                 .cname_rules
                 .iter()
-                .find(|i| i.suffix_trie.ancestor(&reversed_qname).is_some())
+                .find(|i| i.suffix_trie.get(&qname).is_some())
             {
                 let (qtype, qclass) = parse_query_type_and_class(query)?;
                 if qtype == 1 || qtype == 28 {
@@ -99,7 +97,7 @@ async fn query_handler(query: &[u8]) -> Result<Vec<u8>> {
             let rule = config
                 .forward_rules
                 .iter()
-                .find(|i| i.suffix_trie.ancestor(&reversed_qname).is_some());
+                .find(|i| i.suffix_trie.get(&qname).is_some());
 
             if let Some(rule) = &rule {
                 debug!("match rule {:?}", rule.name);

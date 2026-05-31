@@ -8,7 +8,6 @@ tokio = { version = "1.52.3", features = ["net", "macros", "rt-multi-thread", "t
 serde = { version = "1.0", features = ["derive"] }
 toml = { version = "1.1.2", default-features = false, features = ["parse", "serde"] }
 anyhow = "1"
-trie-hard = "0.2.0"
 fastrand = "2.4.1"
 log = "0.4.30"
 env_logger = { version = "0.11.10", default-features = false }
