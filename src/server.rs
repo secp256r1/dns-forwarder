@@ -1,11 +1,8 @@
-use std::net::SocketAddr;
-use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::Arc;
+use std::{net::SocketAddr, sync::Arc};
 
-use anyhow::{Result, anyhow, bail};
+use anyhow::{Error, Result, anyhow, bail};
 use log::{debug, info, warn};
 use tokio::net::UdpSocket;
-use tokio::sync::Mutex;
 
 use crate::{
     cache,
@@ -14,43 +11,14 @@ use crate::{
         Response, analyze_response, build_a_response, build_nxdomain_response, build_query,
         cap_response_ttl, parse_qname, parse_query_type_and_class,
     },
+    forwarder,
 };
-
-const UPSTREAM_POOL_SIZE: usize = 256;
-
-struct SocketPool {
-    sockets: Vec<Mutex<UdpSocket>>,
-    counter: AtomicUsize,
-}
-
-impl SocketPool {
-    async fn new(size: usize) -> Result<Self> {
-        let mut sockets = Vec::with_capacity(size);
-        for _ in 0..size {
-            sockets.push(Mutex::new(UdpSocket::bind("0.0.0.0:0").await?));
-        }
-        Ok(Self {
-            sockets,
-            counter: AtomicUsize::new(0),
-        })
-    }
-
-    async fn acquire(&self) -> tokio::sync::MutexGuard<'_, UdpSocket> {
-        let idx = self
-            .counter
-            .fetch_add(1, Ordering::Relaxed)
-            % self.sockets.len();
-        self.sockets[idx].lock().await
-    }
-}
 
 pub async fn run() -> Result<()> {
     let config = config()?;
 
     let socket = Arc::new(UdpSocket::bind(config.listen).await?);
-    let pool = Arc::new(SocketPool::new(UPSTREAM_POOL_SIZE).await?);
     info!("listening on {}", config.listen);
-    info!("upstream socket pool size: {}", UPSTREAM_POOL_SIZE);
 
     let mut buf = [0u8; 4096];
 
@@ -59,10 +27,9 @@ pub async fn run() -> Result<()> {
         let query = buf[..len].to_vec();
 
         let socket = socket.clone();
-        let pool = pool.clone();
 
         tokio::spawn(async move {
-            match query_handler(&query, &pool).await {
+            match query_handler(&query).await {
                 Ok(response) => {
                     if let Err(e) = socket.send_to(&response, client_addr).await {
                         warn!("failed to send response to {}: {}", client_addr, e);
@@ -76,7 +43,7 @@ pub async fn run() -> Result<()> {
     }
 }
 
-async fn query_handler(query: &[u8], pool: &SocketPool) -> Result<Vec<u8>> {
+async fn query_handler(query: &[u8]) -> Result<Vec<u8>> {
     if query.len() < 12 {
         bail!("query too short");
     }
@@ -120,8 +87,7 @@ async fn query_handler(query: &[u8], pool: &SocketPool) -> Result<Vec<u8>> {
 
                     let query_id = u16::from_be_bytes([query[0], query[1]]);
                     let sub_query = build_query(target, qtype, qclass, query_id);
-                    let r = query_from_upstream(target, &sub_query, &config.default_server, pool)
-                        .await?;
+                    let r = query_from_upstream(target, &sub_query, &config.default_server).await?;
                     let (_, min_ttl) = analyze_response(&r)?;
                     cache::insert(key, r[2..].to_vec(), min_ttl).await;
                     return Ok(r);
@@ -144,7 +110,7 @@ async fn query_handler(query: &[u8], pool: &SocketPool) -> Result<Vec<u8>> {
             }
 
             let upstreams = rule.map(|i| &i.upstreams).unwrap_or(&config.default_server);
-            let r = query_from_upstream(&qname, query, upstreams, pool).await?;
+            let r = query_from_upstream(&qname, query, upstreams).await?;
             let (info, min_ttl) = analyze_response(&r)?;
 
             if let (Some(set), Response::A(a_records)) =
@@ -169,24 +135,23 @@ async fn query_from_upstream(
     qname: &str,
     query: &[u8],
     upstreams: &[SocketAddr],
-    pool: &SocketPool,
 ) -> Result<Vec<u8>> {
-    let socket = pool.acquire().await;
     let upstream = fastrand::choice(upstreams).ok_or_else(|| anyhow!("invalid upstreams"))?;
     debug!("query {qname} from {upstream}");
-    socket.send_to(query, upstream).await?;
+    let f = forwarder::get(upstream).await?;
+    f.send(query).await?;
 
-    let mut buf = vec![0u8; 4096];
-    match tokio::time::timeout(
-        std::time::Duration::from_secs(5),
-        socket.recv_from(&mut buf),
-    )
-    .await
-    {
-        Ok(Ok((len, _))) => Ok(buf[..len].to_vec()),
-        Ok(Err(e)) => {
-            bail!("upstream query {qname} from {upstream} error: {e}");
+    match tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        loop {
+            let result = f.recv().await?;
+            if result[..2] == query[..2] {
+                return Ok::<_, Error>(result);
+            }
         }
+    })
+    .await?
+    {
+        Ok(r) => Ok(r),
         Err(_) => {
             bail!("upstream query {qname} from {upstream} timed out");
         }
