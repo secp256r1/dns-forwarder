@@ -42,8 +42,7 @@ pub async fn get(remote_addr: &SocketAddr) -> Result<Forwarder> {
                     drop(read_guard);
 
                     let remote_addr = *remote_addr;
-                    let (send, sender_recv): (mpsc::Sender<Vec<u8>>, mpsc::Receiver<Vec<u8>>) =
-                        tokio::sync::mpsc::channel(1000);
+                    let (send, sender_recv) = tokio::sync::mpsc::channel(1000);
                     let (recv, _) = tokio::sync::broadcast::channel(1000);
                     let socket_channel = Forwarder { send, recv };
 
