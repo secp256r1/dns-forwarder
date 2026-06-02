@@ -10,7 +10,7 @@ use serde::Deserialize;
 
 use crate::trie::DomainTrie;
 
-const PRIVATE_DOMAINS: &[&str] = &[".lan", ".local", ".home.arpa", ".corp", ".internal"];
+const PRIVATE_DOMAINS: &[&str] = &["lan", "local", "home.arpa", "corp", "internal"];
 
 static CONFIG: OnceLock<Config> = OnceLock::new();
 

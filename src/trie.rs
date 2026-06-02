@@ -2,7 +2,7 @@ use std::collections::HashMap;
 
 #[derive(Debug, Clone)]
 struct DomainTrieNode<V> {
-    children: HashMap<String, DomainTrieNode<V>>,
+    children: HashMap<Box<str>, DomainTrieNode<V>>,
     value: Option<V>,
 }
 
@@ -32,7 +32,7 @@ impl<V> DomainTrie<V> {
         let mut node = &mut self.root;
 
         for label in labels {
-            node = node.children.entry(label.to_string()).or_default();
+            node = node.children.entry(Box::from(label)).or_default();
         }
         node.value = Some(value);
     }
