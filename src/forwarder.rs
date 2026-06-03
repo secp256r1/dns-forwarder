@@ -5,6 +5,7 @@ use log::error;
 use tokio::{
     net::UdpSocket,
     sync::{OnceCell, RwLock, broadcast, mpsc},
+    time::{Duration, timeout},
 };
 
 static FORWARDER: OnceCell<Arc<RwLock<HashMap<SocketAddr, Forwarder>>>> = OnceCell::const_new();
@@ -16,13 +17,29 @@ pub struct Forwarder {
 }
 
 impl Forwarder {
-    pub async fn send(&self, query: &[u8]) -> Result<()> {
-        Ok(self.send.send(query.to_vec()).await?)
-    }
-
-    pub async fn recv(&self) -> Result<Vec<u8>> {
+    pub async fn forward(
+        &self,
+        query: &[u8],
+        qname: &str,
+        upstream: &SocketAddr,
+    ) -> Result<Vec<u8>> {
         let mut recv = self.recv.subscribe();
-        Ok(recv.recv().await?)
+        self.send.send(query.to_vec()).await?;
+        match timeout(Duration::from_secs(5), async {
+            loop {
+                let result = recv.recv().await?;
+                if result[..2] == query[..2] {
+                    break Ok(result);
+                }
+            }
+        })
+        .await
+        {
+            Ok(r) => r,
+            Err(_) => {
+                bail!("get {qname} result from forwarder {upstream} timed out");
+            }
+        }
     }
 }
 
@@ -42,8 +59,8 @@ pub async fn get(remote_addr: &SocketAddr) -> Result<Forwarder> {
                     drop(read_guard);
 
                     let remote_addr = *remote_addr;
-                    let (send, sender_recv) = tokio::sync::mpsc::channel(1000);
-                    let (recv, _) = tokio::sync::broadcast::channel(1000);
+                    let (send, sender_recv) = mpsc::channel(1000);
+                    let (recv, _) = broadcast::channel(1000);
                     let socket_channel = Forwarder { send, recv };
 
                     let socket = UdpSocket::bind("0.0.0.0:0").await?;
@@ -66,14 +83,14 @@ pub async fn get(remote_addr: &SocketAddr) -> Result<Forwarder> {
                     tokio::task::spawn(async move {
                         loop {
                             let mut buf = [0u8; 4096];
-                            let len = match socket.recv(&mut buf).await {
-                                Ok(len) => len,
+                            let r = match socket.recv(&mut buf).await {
+                                Ok(len) => buf[..len].to_vec(),
                                 Err(e) => {
                                     error!("recv from {remote_addr} error: {e}");
                                     continue;
                                 }
                             };
-                            if let Err(e) = send_socket_channel.recv.send(buf[..len].to_vec()) {
+                            if let Err(e) = send_socket_channel.recv.send(r) {
                                 error!("send recv result from {remote_addr} error: {e}");
                             }
                         }

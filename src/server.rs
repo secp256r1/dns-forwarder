@@ -1,6 +1,6 @@
 use std::{net::SocketAddr, sync::Arc};
 
-use anyhow::{Error, Result, anyhow, bail};
+use anyhow::{Result, anyhow, bail};
 use log::{debug, info, warn};
 use tokio::net::UdpSocket;
 
@@ -138,24 +138,10 @@ async fn query_from_upstream(
 ) -> Result<Vec<u8>> {
     let upstream = fastrand::choice(upstreams).ok_or_else(|| anyhow!("invalid upstreams"))?;
     debug!("query {qname} from {upstream}");
-    let f = forwarder::get(upstream).await?;
-    f.send(query).await?;
-
-    match tokio::time::timeout(std::time::Duration::from_secs(5), async {
-        loop {
-            let result = f.recv().await?;
-            if result[..2] == query[..2] {
-                return Ok::<_, Error>(result);
-            }
-        }
-    })
-    .await?
-    {
-        Ok(r) => Ok(r),
-        Err(_) => {
-            bail!("upstream query {qname} from {upstream} timed out");
-        }
-    }
+    forwarder::get(upstream)
+        .await?
+        .forward(query, qname, upstream)
+        .await
 }
 
 fn add_to_nft_set(qname: &str, s: &NftSet, ips: &[String], timeout_secs: u32) -> Result<()> {
