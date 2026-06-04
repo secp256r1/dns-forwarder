@@ -38,20 +38,20 @@ impl<V> DomainTrie<V> {
     }
 
     pub fn get(&self, domain: &str) -> Option<&V> {
-        let labels: Vec<&str> = domain.split('.').rev().collect();
         let mut node = &self.root;
+        let mut last_match = None;
 
-        for label in labels {
+        for label in domain.split('.').rev() {
             match node.children.get(label) {
                 Some(next_node) => {
                     node = next_node;
                     if node.value.is_some() {
-                        return node.value.as_ref();
+                        last_match = node.value.as_ref();
                     }
                 }
-                None => return None,
+                None => break,
             }
         }
-        None
+        last_match
     }
 }
