@@ -9,7 +9,7 @@ use crate::{
     config::{NftSet, config},
     dns::{
         Response, analyze_response, build_a_response, build_nxdomain_response, build_query,
-        cap_response_ttl, parse_qname, parse_query_type_and_class,
+        cap_response_ttl, parse_qname, parse_query_type_and_class, strip_edns0,
     },
     forwarder,
 };
@@ -62,6 +62,7 @@ async fn query_handler(query: &[u8]) -> Result<Vec<u8>> {
         return build_nxdomain_response(query);
     }
 
+    let query = &strip_edns0(query)?;
     let key = query[2..].to_vec();
     match cache::get(&key).await {
         Some((cached, remaining_ttl)) => {

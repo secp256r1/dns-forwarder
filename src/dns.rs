@@ -4,6 +4,7 @@ use crate::config::config;
 
 const DNS_TYPE_A: u16 = 1;
 const DNS_TYPE_AAAA: u16 = 28;
+const DNS_TYPE_OPT: u16 = 41;
 const DNS_CLASS_IN: u16 = 1;
 
 /// Parse the first question's QNAME from a DNS query.
@@ -97,6 +98,88 @@ pub enum Response {
 
 fn u16_be(data: &[u8], offset: usize) -> u16 {
     u16::from_be_bytes([data[offset], data[offset + 1]])
+}
+
+static DNS_HEADER_LEN: usize = 12;
+
+/// Remove the EDNS0 OPT pseudo-record from the additional section of a DNS query.
+/// Returns the stripped query. If no OPT record is present, returns the original.
+pub fn strip_edns0(data: &[u8]) -> Result<Vec<u8>> {
+    if data.len() < DNS_HEADER_LEN {
+        return Ok(data.to_vec());
+    }
+
+    let qdcount = u16_be(data, 4);
+    let ancount = u16_be(data, 6);
+    let nscount = u16_be(data, 8);
+    let arcount = u16_be(data, 10);
+
+    let mut offset = DNS_HEADER_LEN;
+
+    for _ in 0..qdcount {
+        offset = skip_name(data, offset)?;
+        offset += 4;
+    }
+    for _ in 0..ancount {
+        offset = skip_name(data, offset)?;
+        if offset + 10 > data.len() {
+            bail!("answer section truncated");
+        }
+        let rdlength = u16_be(data, offset + 8) as usize;
+        offset += 10 + rdlength;
+    }
+    for _ in 0..nscount {
+        offset = skip_name(data, offset)?;
+        if offset + 10 > data.len() {
+            bail!("authority section truncated");
+        }
+        let rdlength = u16_be(data, offset + 8) as usize;
+        offset += 10 + rdlength;
+    }
+
+    let mut opt_count = 0;
+    let mut tmp = offset;
+    for _ in 0..arcount {
+        let saved = tmp;
+        tmp = skip_name(data, tmp)?;
+        if tmp + 10 > data.len() {
+            bail!("additional section truncated");
+        }
+        let rtype = u16_be(data, tmp);
+        let rdlength = u16_be(data, tmp + 8) as usize;
+        if rtype == DNS_TYPE_OPT {
+            opt_count += 1;
+        } else {
+            tmp = saved;
+            break;
+        }
+        tmp += 10 + rdlength;
+    }
+
+    if opt_count == 0 {
+        return Ok(data.to_vec());
+    }
+
+    let new_arcount = arcount - opt_count;
+    let mut buf = Vec::with_capacity(data.len());
+    buf.extend_from_slice(&data[..10]);
+    buf.extend_from_slice(&new_arcount.to_be_bytes());
+    buf.extend_from_slice(&data[DNS_HEADER_LEN..offset]);
+
+    // Copy non-OPT additional records
+    let mut remaining = tmp;
+    for _ in opt_count..arcount {
+        let start = remaining;
+        remaining = skip_name(data, remaining)?;
+        if remaining + 10 > data.len() {
+            bail!("additional section truncated");
+        }
+        let rdlength = u16_be(data, remaining + 8) as usize;
+        remaining += 10 + rdlength;
+        buf.extend_from_slice(&data[start..remaining]);
+    }
+
+    Ok(buf)
 }
 
 fn skip_name(data: &[u8], mut offset: usize) -> Result<usize> {
