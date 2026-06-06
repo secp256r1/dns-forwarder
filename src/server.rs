@@ -8,8 +8,9 @@ use crate::{
     cache,
     config::{NftSet, config},
     dns::{
-        Response, analyze_response, build_a_response, build_nxdomain_response, build_query,
-        cap_response_ttl, parse_qname, parse_query_type_and_class, strip_edns0,
+        Response, analyze_response, build_a_response, build_cname_chase_response,
+        build_nxdomain_response, build_query, cap_response_ttl, extract_cname_target_and_ttl,
+        parse_qname, parse_query_type_and_class, strip_edns0,
     },
     forwarder,
 };
@@ -111,8 +112,7 @@ async fn query_handler(query: &[u8]) -> Result<Vec<u8>> {
             }
 
             let upstreams = rule.map(|i| &i.upstreams).unwrap_or(&config.default_server);
-            let r = query_from_upstream(&qname, query, upstreams).await?;
-            let (info, min_ttl) = analyze_response(&r)?;
+            let (r, info, min_ttl) = resolve_with_cname_chase(&qname, query, upstreams).await?;
 
             if let (Some(set), Response::A(a_records)) =
                 (rule.as_ref().and_then(|i| i.nft_set.clone()), info)
@@ -130,6 +130,61 @@ async fn query_handler(query: &[u8]) -> Result<Vec<u8>> {
             Ok(r)
         }
     }
+}
+
+/// Resolve a domain, following CNAME chains recursively.
+/// Returns (response_bytes, Response_type, min_ttl).
+async fn resolve_with_cname_chase(
+    qname: &str,
+    query: &[u8],
+    upstreams: &[SocketAddr],
+) -> Result<(Vec<u8>, Response, u32)> {
+    const MAX_CNAME_DEPTH: usize = 10;
+
+    let mut cname_chain: Vec<(String, u32)> = Vec::new();
+    let mut current_query = query.to_vec();
+    let mut current_name = qname.to_string();
+    let mut visited: Vec<String> = Vec::new();
+
+    let (qtype, qclass) = parse_query_type_and_class(query)?;
+    let original_query_id = u16::from_be_bytes([query[0], query[1]]);
+
+    for _depth in 0..=MAX_CNAME_DEPTH {
+        let response = query_from_upstream(&current_name, &current_query, upstreams).await?;
+
+        let (info, _) = analyze_response(&response)?;
+        if matches!(&info, Response::A(ips) if !ips.is_empty()) || matches!(&info, Response::Aaaa) {
+            let a_records = match &info {
+                Response::A(ips) => ips.clone(),
+                _ => vec![],
+            };
+            let final_response = if cname_chain.is_empty() {
+                response
+            } else {
+                build_cname_chase_response(query, &cname_chain, &response, &a_records)?
+            };
+            let (_, min_ttl) = analyze_response(&final_response)?;
+            return Ok((final_response, info, min_ttl));
+        }
+
+        match extract_cname_target_and_ttl(&response, &current_name)? {
+            Some((target, ttl)) => {
+                if visited.contains(&target) {
+                    bail!("CNAME loop detected: {} -> {}", current_name, target);
+                }
+                visited.push(current_name.clone());
+                cname_chain.push((target.clone(), ttl));
+                current_query = build_query(&target, qtype, qclass, original_query_id);
+                current_name = target;
+            }
+            None => {
+                let (_, min_ttl) = analyze_response(&response)?;
+                return Ok((response, info, min_ttl));
+            }
+        }
+    }
+
+    bail!("CNAME resolution exceeded max depth of {}", MAX_CNAME_DEPTH);
 }
 
 async fn query_from_upstream(
