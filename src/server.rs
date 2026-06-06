@@ -5,7 +5,7 @@ use log::{debug, info, warn};
 use tokio::net::UdpSocket;
 
 use crate::{
-    cache::{self, CacheKey},
+    cache,
     config::{NftSet, config},
     dns::{
         Response, analyze_response, build_a_response, build_cname_chase_response,
@@ -65,12 +65,7 @@ async fn query_handler(query: &[u8]) -> Result<Vec<u8>> {
 
     let query = &strip_edns0(query)?;
     let (qtype, qclass) = parse_query_type_and_class(query)?;
-    let cache_key = CacheKey {
-        qname: qname.clone(),
-        qtype,
-        qclass,
-    };
-    match cache::get(&cache_key).await {
+    match cache::get(&qname, qtype, qclass).await {
         Some((cached, remaining_ttl)) => {
             let mut response = [&query[..2], &cached].concat();
             debug!("cache {qname} ttl {remaining_ttl}");
@@ -95,7 +90,7 @@ async fn query_handler(query: &[u8]) -> Result<Vec<u8>> {
                 let sub_query = build_query(target, qtype, qclass, query_id);
                 let r = query_from_upstream(target, &sub_query, &config.default_server).await?;
                 let (_, min_ttl) = analyze_response(&r)?;
-                cache::insert(cache_key.clone(), r[2..].to_vec(), min_ttl).await;
+                cache::insert(target, qtype, qclass, r[2..].to_vec(), min_ttl).await;
                 return Ok(r);
             }
 
@@ -128,7 +123,7 @@ async fn query_handler(query: &[u8]) -> Result<Vec<u8>> {
                 .await??;
             }
 
-            cache::insert(cache_key, r[2..].to_vec(), min_ttl).await;
+            cache::insert(&qname, qtype, qclass, r[2..].to_vec(), min_ttl).await;
             Ok(r)
         }
     }
@@ -208,7 +203,25 @@ fn add_to_nft_set(qname: &str, s: &NftSet, ips: &[String], timeout_secs: u32) ->
         .map(|ip| format!("{ip} timeout {timeout_secs}s"))
         .collect::<Vec<_>>()
         .join(", ");
-    let out = std::process::Command::new("nft")
+
+    let delete_out = std::process::Command::new("nft")
+        .arg("delete")
+        .arg("element")
+        .arg(&s.family)
+        .arg(&s.table)
+        .arg(&s.set)
+        .arg(format!("{{ {} }}", elements))
+        .output()?;
+
+    if !delete_out.status.success() {
+        warn!(
+            "nft delete element '{}' failed: {}",
+            s.set,
+            String::from_utf8_lossy(&delete_out.stderr).trim()
+        );
+    }
+
+    let add_out = std::process::Command::new("nft")
         .arg("add")
         .arg("element")
         .arg(&s.family)
@@ -217,9 +230,9 @@ fn add_to_nft_set(qname: &str, s: &NftSet, ips: &[String], timeout_secs: u32) ->
         .arg(format!("{{ {} }}", elements))
         .output()?;
 
-    if out.status.success() {
+    if add_out.status.success() {
         debug!(
-            "added {} IP(s) of {qname} to nftables set '{}'",
+            "added/updated {} IP(s) of {qname} to nftables set '{}'",
             ips.len(),
             s.set
         );
@@ -227,7 +240,7 @@ fn add_to_nft_set(qname: &str, s: &NftSet, ips: &[String], timeout_secs: u32) ->
         warn!(
             "nft add element '{}' failed: {}",
             s.set,
-            String::from_utf8_lossy(&out.stderr).trim()
+            String::from_utf8_lossy(&add_out.stderr).trim()
         );
     }
     Ok(())
