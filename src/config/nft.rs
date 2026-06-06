@@ -123,7 +123,10 @@ pub(super) fn parse_nft_elements(output: &str) -> Result<Vec<NftElement>> {
         }
 
         for elem in &set_info.elem {
-            elements.push(elem.try_into()?);
+            if let NftSetElem::WithTimeout { .. } = elem {
+            } else {
+                elements.push(elem.try_into()?);
+            }
         }
     }
 
