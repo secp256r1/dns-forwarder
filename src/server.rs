@@ -1,4 +1,7 @@
-use std::{net::{IpAddr, SocketAddr}, sync::Arc};
+use std::{
+    net::{Ipv4Addr, SocketAddr},
+    sync::Arc,
+};
 
 use anyhow::{Result, anyhow, bail};
 use log::{debug, info, warn};
@@ -6,7 +9,7 @@ use tokio::net::UdpSocket;
 
 use crate::{
     cache,
-    config::{NftElement, NftSet, config},
+    config::{NftSet, config},
     dns::{
         Response, analyze_response, build_a_response, build_cname_chase_response,
         build_nxdomain_response, build_query, cap_response_ttl, extract_cname_target_and_ttl,
@@ -197,62 +200,18 @@ async fn query_from_upstream(
         .await
 }
 
-fn ip_in_elements(ip: &IpAddr, elements: &[NftElement]) -> bool {
-    for elem in elements {
-        match (ip, &elem.start, &elem.end) {
-            (IpAddr::V4(ip), IpAddr::V4(start), IpAddr::V4(end)) => {
-                let ip_u32 = u32::from(*ip);
-                let start_u32 = u32::from(*start);
-                let end_u32 = u32::from(*end);
-                if ip_u32 >= start_u32 && ip_u32 <= end_u32 {
-                    return true;
-                }
-            }
-            (IpAddr::V6(ip), IpAddr::V6(start), IpAddr::V6(end)) => {
-                let ip_segments = ip.segments();
-                let start_segments = start.segments();
-                let end_segments = end.segments();
-                let mut ge = true;
-                let mut le = true;
-                for i in 0..8 {
-                    if ip_segments[i] < start_segments[i] {
-                        ge = false;
-                        break;
-                    } else if ip_segments[i] > start_segments[i] {
-                        break;
-                    }
-                }
-                for i in 0..8 {
-                    if ip_segments[i] > end_segments[i] {
-                        le = false;
-                        break;
-                    } else if ip_segments[i] < end_segments[i] {
-                        break;
-                    }
-                }
-                if ge && le {
-                    return true;
-                }
-            }
-            _ => {}
-        }
-    }
-    false
-}
+fn add_to_nft_set(qname: &str, s: &NftSet, ips: &[Ipv4Addr], timeout_secs: u32) -> Result<()> {
+    let ips: Vec<_> = ips.iter().filter(|ip| !s.contains(ip)).collect();
 
-fn add_to_nft_set(qname: &str, s: &NftSet, ips: &[String], timeout_secs: u32) -> Result<()> {
-    let new_ips: Vec<IpAddr> = ips
-        .iter()
-        .filter_map(|ip| ip.parse().ok())
-        .filter(|ip| !ip_in_elements(ip, &s.existing_elements))
-        .collect();
-
-    if new_ips.is_empty() {
-        debug!("all IPs for {qname} already exist in nftables set '{}', skipping", s.set);
+    if ips.is_empty() {
+        debug!(
+            "all IPs for {qname} already exist in nftables set '{}', skipping",
+            s.set
+        );
         return Ok(());
     }
 
-    let elements = new_ips
+    let elements = ips
         .iter()
         .map(|ip| format!("{ip} timeout {timeout_secs}s"))
         .collect::<Vec<_>>()
@@ -287,7 +246,7 @@ fn add_to_nft_set(qname: &str, s: &NftSet, ips: &[String], timeout_secs: u32) ->
     if add_out.status.success() {
         debug!(
             "added/updated {} IP(s) of {qname} to nftables set '{}'",
-            new_ips.len(),
+            ips.len(),
             s.set
         );
     } else {

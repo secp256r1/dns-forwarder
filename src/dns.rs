@@ -1,3 +1,5 @@
+use std::net::Ipv4Addr;
+
 use anyhow::{Result, bail};
 
 use crate::config::config;
@@ -93,7 +95,7 @@ fn encode_domain_to_labels(domain: &str) -> Vec<u8> {
 }
 
 pub enum Response {
-    A(Vec<String>),
+    A(Vec<Ipv4Addr>),
     Aaaa,
 }
 
@@ -292,7 +294,7 @@ pub fn build_cname_chase_response(
     query: &[u8],
     cname_chain: &[(String, u32)],
     source_response: &[u8],
-    a_records: &[String],
+    a_records: &[Ipv4Addr],
 ) -> Result<Vec<u8>> {
     if query.len() < 12 {
         bail!("query too short");
@@ -335,9 +337,8 @@ pub fn build_cname_chase_response(
 
     let rcode = source_response[3] & 0x0F;
 
-    let cap = 12 + question.len()
-        + cname_chain.len() * 64
-        + (source_response.len() - src_answers_start);
+    let cap =
+        12 + question.len() + cname_chain.len() * 64 + (source_response.len() - src_answers_start);
 
     let qname = parse_qname(query)?;
 
@@ -366,21 +367,14 @@ pub fn build_cname_chase_response(
 
     if src_ancount == 0 && !a_records.is_empty() {
         let final_ttl = cname_chain.last().map(|(_, t)| *t).unwrap_or(300);
-        for ip_str in a_records {
+        for ip in a_records {
             let name_encoded = encode_domain_to_labels(&current_name);
-            let ip_parts: Vec<u8> = ip_str
-                .split('.')
-                .filter_map(|s| s.parse().ok())
-                .collect();
-            if ip_parts.len() == 4 {
-                let ip: [u8; 4] = [ip_parts[0], ip_parts[1], ip_parts[2], ip_parts[3]];
-                buf.extend_from_slice(&name_encoded);
-                buf.extend_from_slice(&DNS_TYPE_A.to_be_bytes());
-                buf.extend_from_slice(&DNS_CLASS_IN.to_be_bytes());
-                buf.extend_from_slice(&final_ttl.to_be_bytes());
-                buf.extend_from_slice(&4u16.to_be_bytes());
-                buf.extend_from_slice(&ip);
-            }
+            buf.extend_from_slice(&name_encoded);
+            buf.extend_from_slice(&DNS_TYPE_A.to_be_bytes());
+            buf.extend_from_slice(&DNS_CLASS_IN.to_be_bytes());
+            buf.extend_from_slice(&final_ttl.to_be_bytes());
+            buf.extend_from_slice(&4u16.to_be_bytes());
+            buf.extend_from_slice(ip.octets().as_slice());
         }
     } else {
         buf.extend_from_slice(&source_response[src_answers_start..src_ns_start]);
@@ -438,7 +432,7 @@ pub fn analyze_response(data: &[u8]) -> Result<(Response, u32)> {
                     data[rdata_off + 2],
                     data[rdata_off + 3],
                 );
-                a_records.push(ip);
+                a_records.push(ip.parse()?);
             }
             DNS_TYPE_AAAA => {
                 has_aaaa = true;

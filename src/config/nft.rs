@@ -1,6 +1,6 @@
-use std::{net::IpAddr, net::Ipv4Addr, process::Command};
+use std::{net::Ipv4Addr, process::Command};
 
-use log::warn;
+use anyhow::{Context, Error, Result, bail};
 use serde::Deserialize;
 
 use super::NftElement;
@@ -13,13 +13,21 @@ pub(super) struct NftablesRoot {
 #[derive(Deserialize, Debug)]
 #[serde(untagged)]
 pub(super) enum NftablesItem {
-    Set(NftSetData),
-    Other(()),
+    Set {
+        set: NftSetInfo,
+    },
+    #[allow(dead_code)]
+    MetaInfo {
+        metainfo: MetaInfo,
+    },
 }
 
+#[allow(dead_code)]
 #[derive(Deserialize, Debug)]
-pub(super) struct NftSetData {
-    pub set: NftSetInfo,
+pub struct MetaInfo {
+    version: String,
+    release_name: String,
+    json_schema_version: i32,
 }
 
 #[derive(Deserialize, Debug)]
@@ -31,7 +39,6 @@ pub(super) struct NftSetInfo {
     pub table: String,
     #[serde(rename = "type")]
     pub set_type: String,
-    #[serde(default)]
     pub elem: Vec<NftSetElem>,
 }
 
@@ -39,14 +46,25 @@ pub(super) struct NftSetInfo {
 #[serde(untagged)]
 pub(super) enum NftSetElem {
     Simple(String),
-    Prefixed(NftPrefix),
-    Ranged(NftRange),
-    WithTimeout(NftElemWithTimeout),
+    Prefixed { prefix: NftPrefixInfo },
+    Ranged { range: [String; 2] },
+    WithTimeout { elem: NftElemInner },
 }
 
-#[derive(Deserialize, Debug)]
-pub(super) struct NftPrefix {
-    pub prefix: NftPrefixInfo,
+impl TryFrom<&NftSetElem> for NftElement {
+    type Error = Error;
+
+    fn try_from(value: &NftSetElem) -> Result<Self> {
+        Ok(match value {
+            NftSetElem::Simple(s) => NftElement::Value(s.parse()?),
+            NftSetElem::Prefixed { prefix } => prefix.try_into()?,
+            NftSetElem::Ranged { range } => NftElement::Interval {
+                start: range[0].parse()?,
+                end: range[1].parse()?,
+            },
+            NftSetElem::WithTimeout { elem } => elem.val.as_ref().try_into()?,
+        })
+    }
 }
 
 #[derive(Deserialize, Debug)]
@@ -55,93 +73,68 @@ pub(super) struct NftPrefixInfo {
     pub len: u8,
 }
 
-#[derive(Deserialize, Debug)]
-pub(super) struct NftRange {
-    pub range: [String; 2],
-}
+impl TryFrom<&NftPrefixInfo> for NftElement {
+    type Error = Error;
 
-#[derive(Deserialize, Debug)]
-pub(super) struct NftElemWithTimeout {
-    pub elem: NftElemInner,
+    fn try_from(value: &NftPrefixInfo) -> Result<Self> {
+        let ip: Ipv4Addr = value.addr.parse()?;
+        let mask = if value.len == 0 {
+            0
+        } else {
+            u32::MAX << (32 - value.len)
+        };
+        let masked = ip.to_bits() & mask;
+        let end = masked | !mask;
+
+        Ok(NftElement::Interval {
+            start: Ipv4Addr::from(masked),
+            end: Ipv4Addr::from(end),
+        })
+    }
 }
 
 #[derive(Deserialize, Debug)]
 pub(super) struct NftElemInner {
-    pub val: String,
+    pub val: Box<NftSetElem>,
+    #[allow(dead_code)]
+    pub timeout: u64,
+    #[allow(dead_code)]
+    pub expires: u64,
 }
 
-pub(super) fn ipv4_prefix_to_range(ip: Ipv4Addr, prefix: u8) -> (Ipv4Addr, Ipv4Addr) {
-    let mask = u32::MAX << (32 - prefix);
-    let masked = u32::from(ip) & mask;
-    let end = masked | !mask;
-    (ip, Ipv4Addr::from(end))
-}
-
-pub(super) fn parse_nft_elements(output: &str) -> Vec<NftElement> {
+pub(super) fn parse_nft_elements(output: &str) -> Result<Vec<NftElement>> {
     let mut elements = Vec::new();
 
-    let root: NftablesRoot = match serde_json::from_str(output) {
-        Ok(v) => v,
-        Err(e) => {
-            warn!("failed to parse nftables JSON output: {e}");
-            return elements;
-        }
-    };
+    let root: NftablesRoot =
+        serde_json::from_str(output).context("failed to parse nftables JSON output")?;
 
     for item in &root.nftables {
         let set_info = match item {
-            NftablesItem::Set(s) => &s.set,
-            NftablesItem::Other(_) => continue,
+            NftablesItem::Set { set } => set,
+            NftablesItem::MetaInfo { .. } => continue,
         };
 
         if set_info.set_type != "ipv4_addr" {
-            warn!(
+            bail!(
                 "nftables set '{}' has type '{}', only 'ipv4_addr' is supported, skipping",
-                set_info.name, set_info.set_type
+                set_info.name,
+                set_info.set_type
             );
-            return elements;
         }
 
         for elem in &set_info.elem {
-            match elem {
-                NftSetElem::Simple(s) => {
-                    if let Ok(ip) = s.parse::<Ipv4Addr>() {
-                        let ip = IpAddr::V4(ip);
-                        elements.push(NftElement { start: ip, end: ip });
-                    }
-                }
-                NftSetElem::Prefixed(p) => {
-                    if let Ok(ip) = p.prefix.addr.parse::<Ipv4Addr>() {
-                        let (start, end) = ipv4_prefix_to_range(ip, p.prefix.len);
-                        elements.push(NftElement {
-                            start: IpAddr::V4(start),
-                            end: IpAddr::V4(end),
-                        });
-                    }
-                }
-                NftSetElem::Ranged(r) => {
-                    if let (Ok(start), Ok(end)) =
-                        (r.range[0].parse::<Ipv4Addr>(), r.range[1].parse::<Ipv4Addr>())
-                    {
-                        elements.push(NftElement {
-                            start: IpAddr::V4(start),
-                            end: IpAddr::V4(end),
-                        });
-                    }
-                }
-                NftSetElem::WithTimeout(e) => {
-                    if let Ok(ip) = e.elem.val.parse::<Ipv4Addr>() {
-                        let ip = IpAddr::V4(ip);
-                        elements.push(NftElement { start: ip, end: ip });
-                    }
-                }
-            }
+            elements.push(elem.try_into()?);
         }
     }
-    elements
+
+    Ok(elements)
 }
 
-pub(super) fn fetch_existing_nft_elements(family: &str, table: &str, set: &str) -> Vec<NftElement> {
+pub(super) fn fetch_existing_nft_elements(
+    family: &str,
+    table: &str,
+    set: &str,
+) -> Result<Vec<NftElement>> {
     let output = Command::new("nft")
         .arg("--json")
         .arg("list")
@@ -152,20 +145,17 @@ pub(super) fn fetch_existing_nft_elements(family: &str, table: &str, set: &str) 
         .output();
     match output {
         Ok(out) if out.status.success() => {
-            let stdout = String::from_utf8_lossy(&out.stdout);
-            parse_nft_elements(&stdout)
+            parse_nft_elements(&String::from_utf8_lossy(&out.stdout))
         }
         Ok(out) => {
-            warn!(
+            bail!(
                 "nft list set '{}' failed: {}",
                 set,
                 String::from_utf8_lossy(&out.stderr).trim()
             );
-            Vec::new()
         }
         Err(e) => {
-            warn!("failed to run nft list set '{}': {}", set, e);
-            Vec::new()
+            bail!("failed to run nft list set '{}': {}", set, e);
         }
     }
 }

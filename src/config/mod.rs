@@ -83,10 +83,28 @@ pub struct NftSet {
     pub existing_elements: Vec<NftElement>,
 }
 
+impl NftSet {
+    pub fn contains(&self, ip: &Ipv4Addr) -> bool {
+        self.existing_elements
+            .iter()
+            .find(|i| i.contains(ip))
+            .is_some()
+    }
+}
+
 #[derive(Clone, Debug)]
-pub struct NftElement {
-    pub start: IpAddr,
-    pub end: IpAddr,
+pub enum NftElement {
+    Value(Ipv4Addr),
+    Interval { start: Ipv4Addr, end: Ipv4Addr },
+}
+
+impl NftElement {
+    pub fn contains(&self, ip: &Ipv4Addr) -> bool {
+        match self {
+            NftElement::Value(v) => v == ip,
+            NftElement::Interval { start, end } => ip >= start && ip <= end,
+        }
+    }
 }
 
 #[derive(Deserialize, Clone)]
@@ -171,7 +189,7 @@ impl Config {
                             let table = parts[1].to_string();
                             let set = parts[2].to_string();
                             let existing_elements =
-                                nft::fetch_existing_nft_elements(&family, &table, &set);
+                                nft::fetch_existing_nft_elements(&family, &table, &set)?;
                             if !existing_elements.is_empty() {
                                 info!(
                                     "loaded {} existing nftables elements for set '{}'",
