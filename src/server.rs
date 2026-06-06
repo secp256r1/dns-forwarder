@@ -5,7 +5,7 @@ use log::{debug, info, warn};
 use tokio::net::UdpSocket;
 
 use crate::{
-    cache,
+    cache::{self, CacheKey},
     config::{NftSet, config},
     dns::{
         Response, analyze_response, build_a_response, build_cname_chase_response,
@@ -64,8 +64,13 @@ async fn query_handler(query: &[u8]) -> Result<Vec<u8>> {
     }
 
     let query = &strip_edns0(query)?;
-    let key = query[2..].to_vec();
-    match cache::get(&key).await {
+    let (qtype, qclass) = parse_query_type_and_class(query)?;
+    let cache_key = CacheKey {
+        qname: qname.clone(),
+        qtype,
+        qclass,
+    };
+    match cache::get(&cache_key).await {
         Some((cached, remaining_ttl)) => {
             let mut response = [&query[..2], &cached].concat();
             debug!("cache {qname} ttl {remaining_ttl}");
@@ -77,23 +82,21 @@ async fn query_handler(query: &[u8]) -> Result<Vec<u8>> {
                 .cname_rules
                 .iter()
                 .find(|i| i.suffix_trie.get(&qname).is_some())
+                && (qtype == 1 || qtype == 28)
             {
-                let (qtype, qclass) = parse_query_type_and_class(query)?;
-                if qtype == 1 || qtype == 28 {
-                    let target = fastrand::choice(&cname_rule.cname_targets)
-                        .ok_or_else(|| anyhow!("empty cname_list"))?;
-                    debug!(
-                        "cname chase: {} -> {}, rule: {:?}",
-                        qname, target, cname_rule.name
-                    );
+                let target = fastrand::choice(&cname_rule.cname_targets)
+                    .ok_or_else(|| anyhow!("empty cname_list"))?;
+                debug!(
+                    "cname chase: {} -> {}, rule: {:?}",
+                    qname, target, cname_rule.name
+                );
 
-                    let query_id = u16::from_be_bytes([query[0], query[1]]);
-                    let sub_query = build_query(target, qtype, qclass, query_id);
-                    let r = query_from_upstream(target, &sub_query, &config.default_server).await?;
-                    let (_, min_ttl) = analyze_response(&r)?;
-                    cache::insert(key, r[2..].to_vec(), min_ttl).await;
-                    return Ok(r);
-                }
+                let query_id = fastrand::u16(..);
+                let sub_query = build_query(target, qtype, qclass, query_id);
+                let r = query_from_upstream(target, &sub_query, &config.default_server).await?;
+                let (_, min_ttl) = analyze_response(&r)?;
+                cache::insert(cache_key.clone(), r[2..].to_vec(), min_ttl).await;
+                return Ok(r);
             }
 
             let rule = config
@@ -105,7 +108,6 @@ async fn query_handler(query: &[u8]) -> Result<Vec<u8>> {
                 debug!("match rule {:?}", rule.name);
             }
 
-            let (qtype, _) = parse_query_type_and_class(query)?;
             if qtype == 28 && rule.map(|i| i.block_aaaa) == Some(true) {
                 debug!("AAAA record detected, returning NXDOMAIN response");
                 return build_nxdomain_response(query);
@@ -126,7 +128,7 @@ async fn query_handler(query: &[u8]) -> Result<Vec<u8>> {
                 .await??;
             }
 
-            cache::insert(key, r[2..].to_vec(), min_ttl).await;
+            cache::insert(cache_key, r[2..].to_vec(), min_ttl).await;
             Ok(r)
         }
     }
@@ -147,7 +149,6 @@ async fn resolve_with_cname_chase(
     let mut visited: Vec<String> = Vec::new();
 
     let (qtype, qclass) = parse_query_type_and_class(query)?;
-    let original_query_id = u16::from_be_bytes([query[0], query[1]]);
 
     for _depth in 0..=MAX_CNAME_DEPTH {
         let response = query_from_upstream(&current_name, &current_query, upstreams).await?;
@@ -174,7 +175,8 @@ async fn resolve_with_cname_chase(
                 }
                 visited.push(current_name.clone());
                 cname_chain.push((target.clone(), ttl));
-                current_query = build_query(&target, qtype, qclass, original_query_id);
+                let query_id = fastrand::u16(..);
+                current_query = build_query(&target, qtype, qclass, query_id);
                 current_name = target;
             }
             None => {
