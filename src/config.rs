@@ -6,8 +6,6 @@ use std::{
     sync::OnceLock,
 };
 
-use serde_json::Value;
-
 use anyhow::{Context, Result, anyhow, bail};
 use log::{info, warn};
 use serde::Deserialize;
@@ -88,6 +86,72 @@ pub struct NftSet {
 pub struct NftElement {
     pub start: IpAddr,
     pub end: IpAddr,
+}
+
+#[derive(Deserialize, Debug)]
+struct NftablesRoot {
+    nftables: Vec<NftablesItem>,
+}
+
+#[derive(Deserialize, Debug)]
+#[serde(untagged)]
+enum NftablesItem {
+    Set(NftSetData),
+    Other(()),
+}
+
+#[derive(Deserialize, Debug)]
+struct NftSetData {
+    set: NftSetInfo,
+}
+
+#[derive(Deserialize, Debug)]
+struct NftSetInfo {
+    #[allow(dead_code)]
+    family: String,
+    #[allow(dead_code)]
+    name: String,
+    #[allow(dead_code)]
+    table: String,
+    #[serde(rename = "type")]
+    set_type: String,
+    #[serde(default)]
+    elem: Vec<NftSetElem>,
+}
+
+#[derive(Deserialize, Debug)]
+#[serde(untagged)]
+enum NftSetElem {
+    Simple(String),
+    Prefixed(NftPrefix),
+    Ranged(NftRange),
+    WithTimeout(NftElemWithTimeout),
+}
+
+#[derive(Deserialize, Debug)]
+struct NftPrefix {
+    prefix: NftPrefixInfo,
+}
+
+#[derive(Deserialize, Debug)]
+struct NftPrefixInfo {
+    addr: String,
+    len: u8,
+}
+
+#[derive(Deserialize, Debug)]
+struct NftRange {
+    range: [String; 2],
+}
+
+#[derive(Deserialize, Debug)]
+struct NftElemWithTimeout {
+    elem: NftElemInner,
+}
+
+#[derive(Deserialize, Debug)]
+struct NftElemInner {
+    val: String,
 }
 
 #[derive(Deserialize, Clone)]
@@ -265,65 +329,69 @@ fn parse_dns_server_addr(s: &str) -> Result<SocketAddr> {
     })
 }
 
+fn ipv4_prefix_to_range(ip: Ipv4Addr, prefix: u8) -> (Ipv4Addr, Ipv4Addr) {
+    let mask = u32::MAX << (32 - prefix);
+    let masked = u32::from(ip) & mask;
+    let end = masked | !mask;
+    (ip, Ipv4Addr::from(end))
+}
+
 fn parse_nft_elements(output: &str) -> Vec<NftElement> {
     let mut elements = Vec::new();
-    let json: Value = match serde_json::from_str(output) {
+
+    let root: NftablesRoot = match serde_json::from_str(output) {
         Ok(v) => v,
-        Err(_) => return elements,
+        Err(e) => {
+            warn!("failed to parse nftables JSON output: {e}");
+            return elements;
+        }
     };
 
-    if let Some(nftables) = json["nftables"].as_array() {
-        for obj in nftables {
-            if let Some(set) = obj["set"].as_object() {
-                if let Some(elem) = set["elem"].as_array() {
-                    for item in elem {
-                        if let Some(val) = item["elem"]["val"].as_str() {
-                            if let Ok(ip) = val.parse::<IpAddr>() {
-                                elements.push(NftElement { start: ip, end: ip });
-                            }
-                        } else if let Some(range) = item["range"].as_array() {
-                            if range.len() == 2 {
-                                if let (Some(start_str), Some(end_str)) = (range[0].as_str(), range[1].as_str()) {
-                                    if let (Ok(start), Ok(end)) = (start_str.parse::<IpAddr>(), end_str.parse::<IpAddr>()) {
-                                        elements.push(NftElement { start, end });
-                                    }
-                                }
-                            }
-                        } else if let Some(prefix) = item["prefix"].as_object() {
-                            if let (Some(addr_str), Some(len_val)) = (prefix["addr"].as_str(), prefix["len"].as_u64()) {
-                                if let Ok(ip) = addr_str.parse::<IpAddr>() {
-                                    let prefix = len_val as u8;
-                                    let start = ip;
-                                    let end = match ip {
-                                        IpAddr::V4(ipv4) => {
-                                            let mask = u32::MAX << (32 - prefix);
-                                            let masked = u32::from(ipv4) & mask;
-                                            let end_ip = masked | !mask;
-                                            IpAddr::V4(Ipv4Addr::from(end_ip))
-                                        }
-                                        IpAddr::V6(ipv6) => {
-                                            let segments = ipv6.segments();
-                                            let prefix_bits = prefix as usize;
-                                            let full_segments = prefix_bits / 16;
-                                            let remaining_bits = prefix_bits % 16;
-                                            let mut end_segments = [0u16; 8];
-                                            for i in 0..full_segments {
-                                                end_segments[i] = segments[i];
-                                            }
-                                            if remaining_bits > 0 && full_segments < 8 {
-                                                let mask = 0xFFFF << (16 - remaining_bits);
-                                                end_segments[full_segments] = segments[full_segments] | !mask;
-                                            }
-                                            for i in (full_segments + (if remaining_bits > 0 { 1 } else { 0 }))..8 {
-                                                end_segments[i] = 0xFFFF;
-                                            }
-                                            IpAddr::V6(std::net::Ipv6Addr::from(end_segments))
-                                        }
-                                    };
-                                    elements.push(NftElement { start, end });
-                                }
-                            }
-                        }
+    for item in &root.nftables {
+        let set_info = match item {
+            NftablesItem::Set(s) => &s.set,
+            NftablesItem::Other(_) => continue,
+        };
+
+        if set_info.set_type != "ipv4_addr" {
+            warn!(
+                "nftables set '{}' has type '{}', only 'ipv4_addr' is supported, skipping",
+                set_info.name, set_info.set_type
+            );
+            return elements;
+        }
+
+        for elem in &set_info.elem {
+            match elem {
+                NftSetElem::Simple(s) => {
+                    if let Ok(ip) = s.parse::<Ipv4Addr>() {
+                        let ip = IpAddr::V4(ip);
+                        elements.push(NftElement { start: ip, end: ip });
+                    }
+                }
+                NftSetElem::Prefixed(p) => {
+                    if let Ok(ip) = p.prefix.addr.parse::<Ipv4Addr>() {
+                        let (start, end) = ipv4_prefix_to_range(ip, p.prefix.len);
+                        elements.push(NftElement {
+                            start: IpAddr::V4(start),
+                            end: IpAddr::V4(end),
+                        });
+                    }
+                }
+                NftSetElem::Ranged(r) => {
+                    if let (Ok(start), Ok(end)) =
+                        (r.range[0].parse::<Ipv4Addr>(), r.range[1].parse::<Ipv4Addr>())
+                    {
+                        elements.push(NftElement {
+                            start: IpAddr::V4(start),
+                            end: IpAddr::V4(end),
+                        });
+                    }
+                }
+                NftSetElem::WithTimeout(e) => {
+                    if let Ok(ip) = e.elem.val.parse::<Ipv4Addr>() {
+                        let ip = IpAddr::V4(ip);
+                        elements.push(NftElement { start: ip, end: ip });
                     }
                 }
             }
