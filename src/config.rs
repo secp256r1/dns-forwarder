@@ -6,6 +6,8 @@ use std::{
     sync::OnceLock,
 };
 
+use serde_json::Value;
+
 use anyhow::{Context, Result, anyhow, bail};
 use log::{info, warn};
 use serde::Deserialize;
@@ -265,56 +267,66 @@ fn parse_dns_server_addr(s: &str) -> Result<SocketAddr> {
 
 fn parse_nft_elements(output: &str) -> Vec<NftElement> {
     let mut elements = Vec::new();
-    for line in output.lines() {
-        let line = line.trim();
-        if line.is_empty() || line.starts_with('{') || line.starts_with('}') {
-            continue;
-        }
-        let line = line.trim_end_matches(',').trim();
-        if line.is_empty() {
-            continue;
-        }
-        let elem = line.split_whitespace().next().unwrap_or("");
-        if elem.is_empty() {
-            continue;
-        }
-        if let Some((start_str, end_str)) = elem.split_once('-') {
-            if let (Ok(start), Ok(end)) = (start_str.parse::<IpAddr>(), end_str.parse::<IpAddr>()) {
-                elements.push(NftElement { start, end });
-            }
-        } else if let Some((ip_str, prefix_str)) = elem.split_once('/') {
-            if let (Ok(ip), Ok(prefix)) = (ip_str.parse::<IpAddr>(), prefix_str.parse::<u8>()) {
-                let start = ip;
-                let end = match ip {
-                    IpAddr::V4(ipv4) => {
-                        let mask = u32::MAX << (32 - prefix);
-                        let masked = u32::from(ipv4) & mask;
-                        let end_ip = masked | !mask;
-                        IpAddr::V4(Ipv4Addr::from(end_ip))
+    let json: Value = match serde_json::from_str(output) {
+        Ok(v) => v,
+        Err(_) => return elements,
+    };
+
+    if let Some(nftables) = json["nftables"].as_array() {
+        for obj in nftables {
+            if let Some(set) = obj["set"].as_object() {
+                if let Some(elem) = set["elem"].as_array() {
+                    for item in elem {
+                        if let Some(val) = item["elem"]["val"].as_str() {
+                            if let Ok(ip) = val.parse::<IpAddr>() {
+                                elements.push(NftElement { start: ip, end: ip });
+                            }
+                        } else if let Some(range) = item["range"].as_array() {
+                            if range.len() == 2 {
+                                if let (Some(start_str), Some(end_str)) = (range[0].as_str(), range[1].as_str()) {
+                                    if let (Ok(start), Ok(end)) = (start_str.parse::<IpAddr>(), end_str.parse::<IpAddr>()) {
+                                        elements.push(NftElement { start, end });
+                                    }
+                                }
+                            }
+                        } else if let Some(prefix) = item["prefix"].as_object() {
+                            if let (Some(addr_str), Some(len_val)) = (prefix["addr"].as_str(), prefix["len"].as_u64()) {
+                                if let Ok(ip) = addr_str.parse::<IpAddr>() {
+                                    let prefix = len_val as u8;
+                                    let start = ip;
+                                    let end = match ip {
+                                        IpAddr::V4(ipv4) => {
+                                            let mask = u32::MAX << (32 - prefix);
+                                            let masked = u32::from(ipv4) & mask;
+                                            let end_ip = masked | !mask;
+                                            IpAddr::V4(Ipv4Addr::from(end_ip))
+                                        }
+                                        IpAddr::V6(ipv6) => {
+                                            let segments = ipv6.segments();
+                                            let prefix_bits = prefix as usize;
+                                            let full_segments = prefix_bits / 16;
+                                            let remaining_bits = prefix_bits % 16;
+                                            let mut end_segments = [0u16; 8];
+                                            for i in 0..full_segments {
+                                                end_segments[i] = segments[i];
+                                            }
+                                            if remaining_bits > 0 && full_segments < 8 {
+                                                let mask = 0xFFFF << (16 - remaining_bits);
+                                                end_segments[full_segments] = segments[full_segments] | !mask;
+                                            }
+                                            for i in (full_segments + (if remaining_bits > 0 { 1 } else { 0 }))..8 {
+                                                end_segments[i] = 0xFFFF;
+                                            }
+                                            IpAddr::V6(std::net::Ipv6Addr::from(end_segments))
+                                        }
+                                    };
+                                    elements.push(NftElement { start, end });
+                                }
+                            }
+                        }
                     }
-                    IpAddr::V6(ipv6) => {
-                        let segments = ipv6.segments();
-                        let prefix_bits = prefix as usize;
-                        let full_segments = prefix_bits / 16;
-                        let remaining_bits = prefix_bits % 16;
-                        let mut end_segments = [0u16; 8];
-                        for i in 0..full_segments {
-                            end_segments[i] = segments[i];
-                        }
-                        if remaining_bits > 0 && full_segments < 8 {
-                            let mask = 0xFFFF << (16 - remaining_bits);
-                            end_segments[full_segments] = segments[full_segments] | !mask;
-                        }
-                        for i in (full_segments + (if remaining_bits > 0 { 1 } else { 0 }))..8 {
-                            end_segments[i] = 0xFFFF;
-                        }
-                        IpAddr::V6(std::net::Ipv6Addr::from(end_segments))
-                    }
-                };
-                elements.push(NftElement { start, end });
+                }
             }
-        } else if let Ok(ip) = elem.parse::<IpAddr>() {
-            elements.push(NftElement { start: ip, end: ip });
         }
     }
     elements
@@ -322,6 +334,7 @@ fn parse_nft_elements(output: &str) -> Vec<NftElement> {
 
 fn fetch_existing_nft_elements(family: &str, table: &str, set: &str) -> Vec<NftElement> {
     let output = Command::new("nft")
+        .arg("--json")
         .arg("list")
         .arg("set")
         .arg(family)
