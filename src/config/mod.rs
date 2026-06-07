@@ -1,5 +1,3 @@
-pub mod nft;
-
 use std::{
     fs,
     net::{IpAddr, Ipv4Addr, SocketAddr},
@@ -12,6 +10,8 @@ use log::info;
 use serde::Deserialize;
 
 use crate::trie::DomainTrie;
+
+pub mod nft;
 
 const PRIVATE_DOMAINS: &[&str] = &["lan", "local", "home.arpa", "corp", "internal"];
 
@@ -45,9 +45,6 @@ pub enum RuleKind {
     },
     Block,
     Local,
-    Cname {
-        cname_list: Vec<String>,
-    },
 }
 
 impl RawConfig {
@@ -58,21 +55,14 @@ impl RawConfig {
     }
 }
 
-/// A rule ready for matching at runtime.
 #[derive(Clone)]
 pub struct ForwardRule {
+    pub id: usize,
     pub name: Option<String>,
     pub suffix_trie: DomainTrie<()>,
     pub upstreams: Vec<SocketAddr>,
     pub block_aaaa: bool,
     pub nft_set: Option<NftSet>,
-}
-
-#[derive(Clone)]
-pub struct CnameRule {
-    pub name: Option<String>,
-    pub suffix_trie: DomainTrie<()>,
-    pub cname_targets: Vec<String>,
 }
 
 #[derive(Clone)]
@@ -128,7 +118,6 @@ pub struct Config {
     pub default_server: Vec<SocketAddr>,
     pub cache: CacheConfig,
     pub forward_rules: Vec<ForwardRule>,
-    pub cname_rules: Vec<CnameRule>,
     pub local_domains: DomainTrie<Ipv4Addr>,
     pub blocklist: DomainTrie<()>,
 }
@@ -150,10 +139,9 @@ impl Config {
 
         let mut local_domains = DomainTrie::new();
         let mut blocklist = DomainTrie::new();
-        let mut cname_rules = Vec::new();
         let mut forward_rules = Vec::new();
 
-        for rule in &config.rules {
+        for (id, rule) in config.rules.iter().enumerate() {
             let name = &rule.name;
 
             match &rule.kind {
@@ -164,8 +152,12 @@ impl Config {
                 } => {
                     let mut suffix_trie = DomainTrie::new();
                     for path in &rule.domain_files {
-                        for domain in read_domain_file(&base_dir.join(path))? {
-                            suffix_trie.insert(&domain, ());
+                        for domain in
+                            read_domain_file(&base_dir.join(path), DomainFileKind::Domain)?
+                        {
+                            if let DomainFileItem::Domain(domain) = domain {
+                                suffix_trie.insert(&domain, ());
+                            }
                         }
                     }
 
@@ -208,6 +200,7 @@ impl Config {
                     };
 
                     forward_rules.push(ForwardRule {
+                        id,
                         name: rule.name.clone(),
                         suffix_trie,
                         upstreams,
@@ -215,46 +208,25 @@ impl Config {
                         nft_set,
                     });
                 }
-                RuleKind::Cname { cname_list } => {
-                    let mut suffix_trie = DomainTrie::new();
-                    for path in &rule.domain_files {
-                        for domain in read_domain_file(&base_dir.join(path))? {
-                            suffix_trie.insert(&domain, ());
-                        }
-                    }
-
-                    cname_rules.push(CnameRule {
-                        name: rule.name.clone(),
-                        suffix_trie,
-                        cname_targets: cname_list.clone(),
-                    });
-                }
                 RuleKind::Block => {
                     for path in &rule.domain_files {
-                        for domain in read_domain_file(&base_dir.join(path))? {
-                            blocklist.insert(&domain, ());
+                        for domain in
+                            read_domain_file(&base_dir.join(path), DomainFileKind::Domain)?
+                        {
+                            if let DomainFileItem::Domain(domain) = domain {
+                                blocklist.insert(&domain, ());
+                            }
                         }
                     }
                 }
                 RuleKind::Local => {
-                    for f in &rule.domain_files {
-                        let full_path = base_dir.join(f);
-                        let content = fs::read_to_string(&full_path).with_context(|| {
-                            format!("reading local domain file {}", full_path.display())
-                        })?;
-                        for line in content.lines() {
-                            let line = line.trim();
-                            if line.is_empty() || line.starts_with('#') {
-                                continue;
+                    for path in &rule.domain_files {
+                        for domain in
+                            read_domain_file(&base_dir.join(path), DomainFileKind::DomainWithIpv4)?
+                        {
+                            if let DomainFileItem::DomainWithIpv4 { domain, ip } = domain {
+                                local_domains.insert(&domain, ip);
                             }
-                            let (name, ip) = line
-                                .split_once('=')
-                                .map(|(a, b)| (a.trim(), b.trim()))
-                                .ok_or_else(|| anyhow!("invalid local domain line: '{line}'"))?;
-                            let ip: Ipv4Addr = ip.parse().with_context(|| {
-                                format!("invalid IP in local domain line: '{line}'")
-                            })?;
-                            local_domains.insert(name, ip);
                         }
                     }
                 }
@@ -269,7 +241,6 @@ impl Config {
             listen,
             default_server,
             forward_rules,
-            cname_rules,
             cache: config.cache.unwrap_or_default(),
             local_domains,
             blocklist,
@@ -287,7 +258,17 @@ fn parse_dns_server_addr(s: &str) -> Result<SocketAddr> {
     })
 }
 
-fn read_domain_file(path: &Path) -> Result<Vec<String>> {
+enum DomainFileKind {
+    Domain,
+    DomainWithIpv4,
+}
+
+enum DomainFileItem {
+    Domain(String),
+    DomainWithIpv4 { domain: String, ip: Ipv4Addr },
+}
+
+fn read_domain_file(path: &Path, kind: DomainFileKind) -> Result<Vec<DomainFileItem>> {
     let content = fs::read_to_string(path)
         .with_context(|| format!("reading domain file {}", path.display()))?;
     let mut result = Vec::new();
@@ -296,7 +277,21 @@ fn read_domain_file(path: &Path) -> Result<Vec<String>> {
         if line.is_empty() || line.starts_with('#') {
             continue;
         }
-        result.push(line.to_string());
+
+        result.push(match kind {
+            DomainFileKind::Domain => DomainFileItem::Domain(line.to_string()),
+            DomainFileKind::DomainWithIpv4 => {
+                let (domain, ip) = line
+                    .split_once('=')
+                    .map(|(a, b)| (a.trim(), b.trim()))
+                    .ok_or_else(|| anyhow!("invalid domain with ipv4 line: '{line}'"))?;
+
+                DomainFileItem::DomainWithIpv4 {
+                    domain: domain.to_string(),
+                    ip: ip.parse()?,
+                }
+            }
+        });
     }
 
     Ok(result)

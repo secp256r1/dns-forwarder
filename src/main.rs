@@ -3,6 +3,7 @@ use log::info;
 mod cache;
 mod config;
 mod dns;
+mod extra_domain;
 mod forwarder;
 mod server;
 mod trie;
@@ -19,7 +20,10 @@ async fn main() -> anyhow::Result<()> {
     info!("loading config from {}", config_path.display());
     config::init(&config_path)?;
     let config = config::config()?;
+
+    extra_domain::init().await;
     cache::init(config.cache.max_entries).await;
     forwarder::init().await;
+
     server::run().await
 }

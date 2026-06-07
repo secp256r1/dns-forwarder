@@ -15,7 +15,7 @@ use crate::{
         build_nxdomain_response, build_query, cap_response_ttl, extract_cname_target_and_ttl,
         parse_qname, parse_query_type_and_class, strip_edns0,
     },
-    forwarder,
+    extra_domain, forwarder,
 };
 
 pub async fn run() -> Result<()> {
@@ -76,31 +76,16 @@ async fn query_handler(query: &[u8]) -> Result<Vec<u8>> {
             Ok(response)
         }
         None => {
-            if let Some(cname_rule) = config
-                .cname_rules
-                .iter()
-                .find(|i| i.suffix_trie.get(&qname).is_some())
-                && (qtype == 1 || qtype == 28)
-            {
-                let target = fastrand::choice(&cname_rule.cname_targets)
-                    .ok_or_else(|| anyhow!("empty cname_list"))?;
-                debug!(
-                    "cname chase: {} -> {}, rule: {:?}",
-                    qname, target, cname_rule.name
-                );
-
-                let query_id = fastrand::u16(..);
-                let sub_query = build_query(target, qtype, qclass, query_id);
-                let r = query_from_upstream(target, &sub_query, &config.default_server).await?;
-                let (_, min_ttl) = analyze_response(&r)?;
-                cache::insert(target, qtype, qclass, r[2..].to_vec(), min_ttl).await;
-                return Ok(r);
-            }
-
-            let rule = config
+            let rule = match config
                 .forward_rules
                 .iter()
-                .find(|i| i.suffix_trie.get(&qname).is_some());
+                .find(|i| i.suffix_trie.get(&qname).is_some())
+            {
+                Some(rule) => Some(rule),
+                None => extra_domain::match_domain(&qname)
+                    .await
+                    .and_then(|rule_id| config.forward_rules.iter().find(|i| i.id == rule_id)),
+            };
 
             if let Some(rule) = &rule {
                 debug!("match rule {:?}", rule.name);
@@ -112,7 +97,8 @@ async fn query_handler(query: &[u8]) -> Result<Vec<u8>> {
             }
 
             let upstreams = rule.map(|i| &i.upstreams).unwrap_or(&config.default_server);
-            let (r, info, min_ttl) = resolve_with_cname_chase(&qname, query, upstreams).await?;
+            let (r, info, min_ttl) =
+                resolve_with_cname_chase(&qname, query, upstreams, rule.map(|i| i.id)).await?;
 
             if let (Some(set), Response::A(a_records)) =
                 (rule.as_ref().and_then(|i| i.nft_set.clone()), info)
@@ -138,6 +124,7 @@ async fn resolve_with_cname_chase(
     qname: &str,
     query: &[u8],
     upstreams: &[SocketAddr],
+    rule_id: Option<usize>,
 ) -> Result<(Vec<u8>, Response, u32)> {
     const MAX_CNAME_DEPTH: usize = 10;
 
@@ -170,6 +157,9 @@ async fn resolve_with_cname_chase(
             Some((target, ttl)) => {
                 if visited.contains(&target) {
                     bail!("CNAME loop detected: {} -> {}", current_name, target);
+                }
+                if let Some(rule_id) = rule_id {
+                    extra_domain::add_domain(&target, rule_id).await;
                 }
                 visited.push(current_name.clone());
                 cname_chain.push((target.clone(), ttl));
