@@ -192,28 +192,29 @@ fn add_to_nft_set(qname: &str, s: &NftSet, ips: &[Ipv4Addr], timeout_secs: u32) 
         return Ok(());
     }
 
+    for ip in &ips {
+        let delete_out = std::process::Command::new("nft")
+            .arg("delete")
+            .arg("element")
+            .arg(&s.family)
+            .arg(&s.table)
+            .arg(&s.set)
+            .arg(format!("{{ {ip} }}"))
+            .output()?;
+        if !delete_out.status.success() {
+            debug!(
+                "nft delete element '{ip}' from '{}' skipped (not present): {}",
+                s.set,
+                String::from_utf8_lossy(&delete_out.stderr).trim()
+            );
+        }
+    }
+
     let elements = ips
         .iter()
         .map(|ip| format!("{ip} timeout {timeout_secs}s"))
         .collect::<Vec<_>>()
         .join(", ");
-
-    let delete_out = std::process::Command::new("nft")
-        .arg("delete")
-        .arg("element")
-        .arg(&s.family)
-        .arg(&s.table)
-        .arg(&s.set)
-        .arg(format!("{{ {} }}", elements))
-        .output()?;
-
-    if !delete_out.status.success() {
-        warn!(
-            "nft delete element '{}' failed: {}",
-            s.set,
-            String::from_utf8_lossy(&delete_out.stderr).trim()
-        );
-    }
 
     let add_out = std::process::Command::new("nft")
         .arg("add")
@@ -221,7 +222,7 @@ fn add_to_nft_set(qname: &str, s: &NftSet, ips: &[Ipv4Addr], timeout_secs: u32) 
         .arg(&s.family)
         .arg(&s.table)
         .arg(&s.set)
-        .arg(format!("{{ {} }}", elements))
+        .arg(format!("{{ {elements} }}"))
         .output()?;
 
     if add_out.status.success() {
