@@ -11,9 +11,8 @@ use crate::{
     cache,
     config::{NftSet, config},
     dns::{
-        Response, analyze_response, build_a_response, build_cname_chase_response,
-        build_nxdomain_response, build_query, cap_response_ttl, extract_cname_target_and_ttl,
-        parse_qname, parse_query_type_and_class, strip_edns0,
+        QueryInfo, Response, analyze_response, build_a_response, build_cname_chase_response,
+        build_nxdomain_response, build_query, cap_response_ttl,
     },
     extra_domain, forwarder,
 };
@@ -48,30 +47,24 @@ pub async fn run() -> Result<()> {
 }
 
 async fn query_handler(query: &[u8]) -> Result<Vec<u8>> {
-    if query.len() < 12 {
-        bail!("query too short");
-    }
-
-    let qname = parse_qname(query)?;
-
+    let info = QueryInfo::parse(query)?;
+    let query_id = &query[..2];
     let config = config()?;
 
-    if let Some(ip) = config.local_domains.get(&qname) {
-        debug!("local domain match: {} -> {}", qname, ip);
+    if let Some(ip) = config.local_domains.get(&info.qname) {
+        debug!("local domain match: {} -> {ip}", &info.qname);
         return build_a_response(query, &ip.octets());
     }
 
-    if config.blocklist.get(&qname).is_some() {
-        debug!("private domain or blocklist match: {qname}");
+    if config.blocklist.get(&info.qname).is_some() {
+        debug!("private domain or blocklist match: {}", &info.qname);
         return build_nxdomain_response(query);
     }
 
-    let query = &strip_edns0(query)?;
-    let (qtype, qclass) = parse_query_type_and_class(query)?;
-    match cache::get(&qname, qtype, qclass).await {
+    match cache::get(&info).await {
         Some((cached, remaining_ttl)) => {
-            let mut response = [&query[..2], &cached].concat();
-            debug!("cache {qname} ttl {remaining_ttl}");
+            let mut response = [query_id, &cached].concat();
+            debug!("cache {} ttl {remaining_ttl}", &info.qname);
             cap_response_ttl(&mut response, remaining_ttl)?;
             Ok(response)
         }
@@ -79,10 +72,10 @@ async fn query_handler(query: &[u8]) -> Result<Vec<u8>> {
             let rule = match config
                 .forward_rules
                 .iter()
-                .find(|i| i.suffix_trie.get(&qname).is_some())
+                .find(|i| i.suffix_trie.get(&info.qname).is_some())
             {
                 Some(rule) => Some(rule),
-                None => extra_domain::match_domain(&qname)
+                None => extra_domain::match_domain(&info.qname)
                     .await
                     .and_then(|rule_id| config.forward_rules.iter().find(|i| i.id == rule_id)),
             };
@@ -91,90 +84,88 @@ async fn query_handler(query: &[u8]) -> Result<Vec<u8>> {
                 debug!("match rule {:?}", rule.name);
             }
 
-            if qtype == 28 && rule.map(|i| i.block_aaaa) == Some(true) {
+            if info.qtype == 28 && rule.map(|i| i.block_aaaa) == Some(true) {
                 debug!("AAAA record detected, returning NXDOMAIN response");
                 return build_nxdomain_response(query);
             }
 
             let upstreams = rule.map(|i| &i.upstreams).unwrap_or(&config.default_server);
-            let (r, info, min_ttl) =
-                resolve_with_cname_chase(&qname, query, upstreams, rule.map(|i| i.id)).await?;
+            let (r, resp, ttl) = resolve_with_cname_chase(
+                &info,
+                query,
+                upstreams,
+                rule.map(|i| i.id),
+                Vec::new(),
+                0,
+            )
+            .await?;
 
             if let (Some(set), Response::A(a_records)) =
-                (rule.as_ref().and_then(|i| i.nft_set.clone()), info)
+                (rule.as_ref().and_then(|i| i.nft_set.clone()), resp)
                 && !a_records.is_empty()
             {
-                let qname = qname.to_string();
+                let qname = info.qname.clone();
                 let records = a_records.clone();
                 tokio::task::spawn_blocking(move || {
-                    add_to_nft_set(&qname, &set, &records, min_ttl * 2)
+                    add_to_nft_set(&qname, &set, &records, ttl * 2)
                 })
                 .await??;
             }
 
-            cache::insert(&qname, qtype, qclass, r[2..].to_vec(), min_ttl).await;
-            Ok(r)
+            let r = &r[2..];
+            cache::insert(&info, r.to_vec(), ttl).await;
+            Ok([query_id, r].concat())
         }
     }
 }
 
-/// Resolve a domain, following CNAME chains recursively.
-/// Returns (response_bytes, Response_type, min_ttl).
 async fn resolve_with_cname_chase(
-    qname: &str,
-    query: &[u8],
+    info: &QueryInfo,
+    original_query: &[u8],
     upstreams: &[SocketAddr],
     rule_id: Option<usize>,
+    mut cname_chain: Vec<(String, u32)>,
+    depth: usize,
 ) -> Result<(Vec<u8>, Response, u32)> {
-    const MAX_CNAME_DEPTH: usize = 10;
+    if depth > 10 {
+        bail!("CNAME resolution exceeded max depth of 10");
+    }
 
-    let mut cname_chain: Vec<(String, u32)> = Vec::new();
-    let mut current_query = query.to_vec();
-    let mut current_name = qname.to_string();
-    let mut visited: Vec<String> = Vec::new();
+    let current_query = build_query(fastrand::u16(..), info);
+    let response = query_from_upstream(&info.qname, &current_query, upstreams).await?;
 
-    let (qtype, qclass) = parse_query_type_and_class(query)?;
-
-    for _depth in 0..=MAX_CNAME_DEPTH {
-        let response = query_from_upstream(&current_name, &current_query, upstreams).await?;
-
-        let (info, _) = analyze_response(&response)?;
-        if matches!(&info, Response::A(ips) if !ips.is_empty()) || matches!(&info, Response::Aaaa) {
-            let a_records = match &info {
-                Response::A(ips) => ips.clone(),
-                _ => vec![],
-            };
+    let (resp, ttl) = analyze_response(&response)?;
+    match resp {
+        x @ (Response::A(_) | Response::Aaaa) => {
             let final_response = if cname_chain.is_empty() {
                 response
             } else {
-                build_cname_chase_response(query, &cname_chain, &response, &a_records)?
+                build_cname_chase_response(original_query, &cname_chain, &response, &x, ttl)?
             };
-            let (_, min_ttl) = analyze_response(&final_response)?;
-            return Ok((final_response, info, min_ttl));
+            Ok((final_response, x, ttl))
         }
+        Response::Cname(target) => {
+            if cname_chain.iter().any(|(name, _)| name == &target) {
+                bail!("CNAME loop detected: {}", target);
+            }
+            if let Some(rule_id) = rule_id {
+                extra_domain::add_domain(&target, rule_id).await;
+            }
+            cname_chain.push((target.clone(), ttl));
 
-        match extract_cname_target_and_ttl(&response, &current_name)? {
-            Some((target, ttl)) => {
-                if visited.contains(&target) {
-                    bail!("CNAME loop detected: {} -> {}", current_name, target);
-                }
-                if let Some(rule_id) = rule_id {
-                    extra_domain::add_domain(&target, rule_id).await;
-                }
-                visited.push(current_name.clone());
-                cname_chain.push((target.clone(), ttl));
-                let query_id = fastrand::u16(..);
-                current_query = build_query(&target, qtype, qclass, query_id);
-                current_name = target;
-            }
-            None => {
-                let (_, min_ttl) = analyze_response(&response)?;
-                return Ok((response, info, min_ttl));
-            }
+            let info = info.new_qname(&target);
+
+            Box::pin(resolve_with_cname_chase(
+                &info,
+                original_query,
+                upstreams,
+                rule_id,
+                cname_chain,
+                depth + 1,
+            ))
+            .await
         }
     }
-
-    bail!("CNAME resolution exceeded max depth of {}", MAX_CNAME_DEPTH);
 }
 
 async fn query_from_upstream(

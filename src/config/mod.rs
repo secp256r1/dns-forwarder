@@ -100,13 +100,27 @@ impl NftElement {
 #[derive(Deserialize, Clone)]
 pub struct CacheConfig {
     pub max_entries: usize,
+    pub min_ttl: u64,
     pub max_ttl: u64,
+}
+
+impl CacheConfig {
+    pub fn normalize_ttl(&self, value: u64) -> u64 {
+        if value > self.max_ttl {
+            self.max_ttl
+        } else if value < self.min_ttl {
+            self.min_ttl
+        } else {
+            value
+        }
+    }
 }
 
 impl Default for CacheConfig {
     fn default() -> Self {
         CacheConfig {
             max_entries: 100_000,
+            min_ttl: 60,
             max_ttl: 3600,
         }
     }

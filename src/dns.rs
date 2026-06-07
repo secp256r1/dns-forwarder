@@ -7,66 +7,79 @@ use crate::config::config;
 const DNS_TYPE_A: u16 = 1;
 const DNS_TYPE_AAAA: u16 = 28;
 const DNS_TYPE_CNAME: u16 = 5;
-const DNS_TYPE_OPT: u16 = 41;
 const DNS_CLASS_IN: u16 = 1;
 
-/// Parse the first question's QNAME from a DNS query.
-pub fn parse_qname(data: &[u8]) -> Result<String> {
-    if data.len() < 12 {
-        bail!("query too short");
-    }
-
-    let mut offset = 12;
-    let mut labels = Vec::new();
-    let mut jumped = false;
-
-    loop {
-        if offset >= data.len() {
-            bail!("name extends past end of packet");
-        }
-        let len = data[offset];
-        if len == 0 {
-            break;
-        }
-        if len & 0xC0 == 0xC0 {
-            if offset + 1 >= data.len() {
-                bail!("compression pointer truncated");
-            }
-            let pointer = u16::from_be_bytes([data[offset], data[offset + 1]]) & 0x3FFF;
-            if !jumped {
-                jumped = true;
-            }
-            offset = pointer as usize;
-        } else {
-            offset += 1;
-            if offset + len as usize > data.len() {
-                bail!("label extends past end of packet");
-            }
-            labels.push(std::str::from_utf8(&data[offset..offset + len as usize])?.to_string());
-            offset += len as usize;
-        }
-    }
-
-    Ok(labels.join("."))
+pub struct QueryInfo {
+    pub qname: String,
+    pub qtype: u16,
+    pub qclass: u16,
 }
 
-/// Parse the QTYPE (query type) from a DNS query.
-/// Parse both QTYPE and QCLASS from a DNS query.
-pub fn parse_query_type_and_class(data: &[u8]) -> Result<(u16, u16)> {
-    if data.len() < 16 {
-        bail!("query too short");
+impl QueryInfo {
+    pub fn parse(data: &[u8]) -> Result<QueryInfo> {
+        if data.len() < 12 {
+            bail!("query too short");
+        }
+
+        let mut offset = 12;
+        let mut labels = Vec::new();
+        let mut jumped = false;
+        let mut end_offset = offset;
+
+        loop {
+            if offset >= data.len() {
+                bail!("name extends past end of packet");
+            }
+            let len = data[offset];
+            if len == 0 {
+                if !jumped {
+                    end_offset = offset + 1;
+                }
+                break;
+            }
+            if len & 0xC0 == 0xC0 {
+                if offset + 1 >= data.len() {
+                    bail!("compression pointer truncated");
+                }
+                let pointer = u16::from_be_bytes([data[offset], data[offset + 1]]) & 0x3FFF;
+                if !jumped {
+                    end_offset = offset + 2;
+                    jumped = true;
+                }
+                offset = pointer as usize;
+            } else {
+                offset += 1;
+                if offset + len as usize > data.len() {
+                    bail!("label extends past end of packet");
+                }
+                labels.push(std::str::from_utf8(&data[offset..offset + len as usize])?.to_string());
+                offset += len as usize;
+            }
+        }
+
+        if end_offset + 4 > data.len() {
+            bail!("query truncated");
+        }
+
+        Ok(QueryInfo {
+            qname: labels.join("."),
+            qtype: u16_be(data, end_offset),
+            qclass: u16_be(data, end_offset + 2),
+        })
     }
-    let mut offset = 12;
-    offset = skip_name(data, offset)?;
-    if offset + 4 > data.len() {
-        bail!("query truncated");
+
+    pub fn new_qname(&self, qname: &str) -> QueryInfo {
+        QueryInfo {
+            qname: qname.to_string(),
+            qtype: self.qtype,
+            qclass: self.qclass,
+        }
     }
-    Ok((u16_be(data, offset), u16_be(data, offset + 2)))
 }
 
 /// Build a DNS query packet for the given target domain, QTYPE and QCLASS.
-pub fn build_query(target: &str, qtype: u16, qclass: u16, query_id: u16) -> Vec<u8> {
-    let qname = encode_domain_to_labels(target);
+pub fn build_query(query_id: u16, info: &QueryInfo) -> Vec<u8> {
+    let qname = encode_domain_to_labels(&info.qname);
     let mut buf = Vec::with_capacity(12 + qname.len() + 4);
     buf.extend_from_slice(&query_id.to_be_bytes());
     buf.push(0x01); // QR=0, RD=1
@@ -76,8 +89,8 @@ pub fn build_query(target: &str, qtype: u16, qclass: u16, query_id: u16) -> Vec<
     buf.extend_from_slice(&[0x00, 0x00]);
     buf.extend_from_slice(&[0x00, 0x00]);
     buf.extend_from_slice(&qname);
-    buf.extend_from_slice(&qtype.to_be_bytes());
-    buf.extend_from_slice(&qclass.to_be_bytes());
+    buf.extend_from_slice(&info.qtype.to_be_bytes());
+    buf.extend_from_slice(&info.qclass.to_be_bytes());
     buf
 }
 
@@ -97,92 +110,11 @@ fn encode_domain_to_labels(domain: &str) -> Vec<u8> {
 pub enum Response {
     A(Vec<Ipv4Addr>),
     Aaaa,
+    Cname(String),
 }
 
 fn u16_be(data: &[u8], offset: usize) -> u16 {
     u16::from_be_bytes([data[offset], data[offset + 1]])
-}
-
-static DNS_HEADER_LEN: usize = 12;
-
-/// Remove the EDNS0 OPT pseudo-record from the additional section of a DNS query.
-/// Returns the stripped query. If no OPT record is present, returns the original.
-pub fn strip_edns0(data: &[u8]) -> Result<Vec<u8>> {
-    if data.len() < DNS_HEADER_LEN {
-        return Ok(data.to_vec());
-    }
-
-    let qdcount = u16_be(data, 4);
-    let ancount = u16_be(data, 6);
-    let nscount = u16_be(data, 8);
-    let arcount = u16_be(data, 10);
-
-    let mut offset = DNS_HEADER_LEN;
-
-    for _ in 0..qdcount {
-        offset = skip_name(data, offset)?;
-        offset += 4;
-    }
-    for _ in 0..ancount {
-        offset = skip_name(data, offset)?;
-        if offset + 10 > data.len() {
-            bail!("answer section truncated");
-        }
-        let rdlength = u16_be(data, offset + 8) as usize;
-        offset += 10 + rdlength;
-    }
-    for _ in 0..nscount {
-        offset = skip_name(data, offset)?;
-        if offset + 10 > data.len() {
-            bail!("authority section truncated");
-        }
-        let rdlength = u16_be(data, offset + 8) as usize;
-        offset += 10 + rdlength;
-    }
-
-    let mut opt_count = 0;
-    let mut tmp = offset;
-    for _ in 0..arcount {
-        let saved = tmp;
-        tmp = skip_name(data, tmp)?;
-        if tmp + 10 > data.len() {
-            bail!("additional section truncated");
-        }
-        let rtype = u16_be(data, tmp);
-        let rdlength = u16_be(data, tmp + 8) as usize;
-        if rtype == DNS_TYPE_OPT {
-            opt_count += 1;
-        } else {
-            tmp = saved;
-            break;
-        }
-        tmp += 10 + rdlength;
-    }
-
-    if opt_count == 0 {
-        return Ok(data.to_vec());
-    }
-
-    let new_arcount = arcount - opt_count;
-    let mut buf = Vec::with_capacity(data.len());
-    buf.extend_from_slice(&data[..10]);
-    buf.extend_from_slice(&new_arcount.to_be_bytes());
-    buf.extend_from_slice(&data[DNS_HEADER_LEN..offset]);
-
-    // Copy non-OPT additional records
-    let mut remaining = tmp;
-    for _ in opt_count..arcount {
-        let start = remaining;
-        remaining = skip_name(data, remaining)?;
-        if remaining + 10 > data.len() {
-            bail!("additional section truncated");
-        }
-        let rdlength = u16_be(data, remaining + 8) as usize;
-        remaining += 10 + rdlength;
-        buf.extend_from_slice(&data[start..remaining]);
-    }
-
-    Ok(buf)
 }
 
 fn skip_name(data: &[u8], mut offset: usize) -> Result<usize> {
@@ -242,49 +174,42 @@ pub fn read_domain_name(data: &[u8], mut offset: usize) -> Result<(String, usize
     Ok((labels.join("."), end_offset))
 }
 
-/// Extract the CNAME target domain and TTL from a DNS response.
-/// Returns `Ok(Some((target, ttl)))` if a CNAME record matching qname is found.
-pub fn extract_cname_target_and_ttl(data: &[u8], qname: &str) -> Result<Option<(String, u32)>> {
-    if data.len() < 12 {
-        bail!("response too short");
-    }
-
-    let qdcount = u16_be(data, 4);
-    let ancount = u16_be(data, 6);
-
-    let mut offset = 12;
-    for _ in 0..qdcount {
-        offset = skip_name(data, offset)?;
-        offset += 4;
-    }
-
-    for _ in 0..ancount {
-        let (name, new_offset) = read_domain_name(data, offset)?;
-        offset = new_offset;
-
-        if offset + 10 > data.len() {
-            bail!("answer record truncated");
+/// Copy a section of DNS resource records, decompressing owner names and
+/// re-encoding them uncompressed to avoid broken compression pointers.
+fn copy_rr_section(
+    buf: &mut Vec<u8>,
+    data: &[u8],
+    mut off: usize,
+    count: u16,
+) -> Result<usize> {
+    for _ in 0..count {
+        let (name, next) = read_domain_name(data, off)?;
+        if next + 10 > data.len() {
+            bail!("resource record truncated");
         }
-
-        let rtype = u16_be(data, offset);
+        let rtype = u16_be(data, next);
+        let rclass = u16_be(data, next + 2);
         let ttl = u32::from_be_bytes([
-            data[offset + 4],
-            data[offset + 5],
-            data[offset + 6],
-            data[offset + 7],
+            data[next + 4],
+            data[next + 5],
+            data[next + 6],
+            data[next + 7],
         ]);
-        let rdlength = u16_be(data, offset + 8) as usize;
-        let rdata_off = offset + 10;
-
-        if rtype == DNS_TYPE_CNAME && name.eq_ignore_ascii_case(qname) {
-            let (target, _) = read_domain_name(data, rdata_off)?;
-            return Ok(Some((target, ttl)));
+        let rdlength = u16_be(data, next + 8) as usize;
+        let rdata_off = next + 10;
+        if rdata_off + rdlength > data.len() {
+            bail!("rdata truncated");
         }
-
-        offset = rdata_off + rdlength;
+        let name_encoded = encode_domain_to_labels(&name);
+        buf.extend_from_slice(&name_encoded);
+        buf.extend_from_slice(&rtype.to_be_bytes());
+        buf.extend_from_slice(&rclass.to_be_bytes());
+        buf.extend_from_slice(&ttl.to_be_bytes());
+        buf.extend_from_slice(&(rdlength as u16).to_be_bytes());
+        buf.extend_from_slice(&data[rdata_off..rdata_off + rdlength]);
+        off = rdata_off + rdlength;
     }
-
-    Ok(None)
+    Ok(off)
 }
 
 /// Build a complete DNS response that includes the original question, a CNAME
@@ -294,7 +219,8 @@ pub fn build_cname_chase_response(
     query: &[u8],
     cname_chain: &[(String, u32)],
     source_response: &[u8],
-    a_records: &[Ipv4Addr],
+    response: &Response,
+    ttl: u32,
 ) -> Result<Vec<u8>> {
     if query.len() < 12 {
         bail!("query too short");
@@ -333,14 +259,22 @@ pub fn build_cname_chase_response(
     }
     let src_additional_start = src_off;
 
-    let total_ancount = cname_chain.len() as u16 + src_ancount;
+    let extra_a_count = if src_ancount == 0
+        && let Response::A(ips) = response
+        && !ips.is_empty()
+    {
+        ips.len()
+    } else {
+        0
+    };
+    let total_ancount = cname_chain.len() as u16 + src_ancount + extra_a_count as u16;
 
     let rcode = source_response[3] & 0x0F;
 
     let cap =
         12 + question.len() + cname_chain.len() * 64 + (source_response.len() - src_answers_start);
 
-    let qname = parse_qname(query)?;
+    let qname = QueryInfo::parse(query)?.qname;
 
     let mut buf = Vec::with_capacity(cap);
     buf.extend_from_slice(&query[..2]);
@@ -365,23 +299,25 @@ pub fn build_cname_chase_response(
         current_name = target.clone();
     }
 
-    if src_ancount == 0 && !a_records.is_empty() {
-        let final_ttl = cname_chain.last().map(|(_, t)| *t).unwrap_or(300);
-        for ip in a_records {
+    if src_ancount == 0
+        && let Response::A(ips) = response
+        && !ips.is_empty()
+    {
+        for ip in ips {
             let name_encoded = encode_domain_to_labels(&current_name);
             buf.extend_from_slice(&name_encoded);
             buf.extend_from_slice(&DNS_TYPE_A.to_be_bytes());
             buf.extend_from_slice(&DNS_CLASS_IN.to_be_bytes());
-            buf.extend_from_slice(&final_ttl.to_be_bytes());
+            buf.extend_from_slice(&ttl.to_be_bytes());
             buf.extend_from_slice(&4u16.to_be_bytes());
             buf.extend_from_slice(ip.octets().as_slice());
         }
     } else {
-        buf.extend_from_slice(&source_response[src_answers_start..src_ns_start]);
+        copy_rr_section(&mut buf, source_response, src_answers_start, src_ancount)?;
     }
 
-    buf.extend_from_slice(&source_response[src_ns_start..src_additional_start]);
-    buf.extend_from_slice(&source_response[src_additional_start..]);
+    copy_rr_section(&mut buf, source_response, src_ns_start, src_nscount)?;
+    copy_rr_section(&mut buf, source_response, src_additional_start, src_arcount)?;
 
     Ok(buf)
 }
@@ -402,9 +338,10 @@ pub fn analyze_response(data: &[u8]) -> Result<(Response, u32)> {
 
     let config = config()?;
 
-    let mut min_ttl = config.cache.max_ttl as u32;
+    let mut max_ttl = 0;
     let mut has_aaaa = false;
     let mut a_records = Vec::new();
+    let mut cname_target = None;
     for _ in 0..ancount {
         offset = skip_name(data, offset)?;
         if offset + 10 > data.len() {
@@ -417,7 +354,7 @@ pub fn analyze_response(data: &[u8]) -> Result<(Response, u32)> {
             data[offset + 6],
             data[offset + 7],
         ]);
-        min_ttl = min_ttl.min(ttl);
+        max_ttl = max_ttl.max(ttl);
 
         let rtype = u16_be(data, offset);
         let rdlength = u16_be(data, offset + 8) as usize;
@@ -436,7 +373,10 @@ pub fn analyze_response(data: &[u8]) -> Result<(Response, u32)> {
             }
             DNS_TYPE_AAAA => {
                 has_aaaa = true;
-                break;
+            }
+            DNS_TYPE_CNAME if cname_target.is_none() => {
+                let (target, _) = read_domain_name(data, rdata_off)?;
+                cname_target = Some(target);
             }
             _ => {}
         }
@@ -444,14 +384,26 @@ pub fn analyze_response(data: &[u8]) -> Result<(Response, u32)> {
         offset = rdata_off + rdlength;
     }
 
-    Ok((
-        if has_aaaa {
-            Response::Aaaa
-        } else {
-            Response::A(a_records)
-        },
-        min_ttl,
-    ))
+    if !a_records.is_empty() || has_aaaa {
+        Ok((
+            if has_aaaa {
+                Response::Aaaa
+            } else {
+                Response::A(a_records)
+            },
+            config.cache.normalize_ttl(max_ttl as u64) as u32,
+        ))
+    } else if let Some(target) = cname_target {
+        Ok((
+            Response::Cname(target),
+            config.cache.normalize_ttl(max_ttl as u64) as u32,
+        ))
+    } else {
+        Ok((
+            Response::A(Vec::new()),
+            config.cache.normalize_ttl(max_ttl as u64) as u32,
+        ))
+    }
 }
 
 pub fn cap_response_ttl(response: &mut [u8], max_ttl: u32) -> Result<()> {

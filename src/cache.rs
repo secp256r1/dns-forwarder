@@ -5,6 +5,8 @@ use std::{
 };
 use tokio::sync::{OnceCell, RwLock};
 
+use crate::dns::QueryInfo;
+
 type CacheKey = (Arc<str>, u16, u16);
 type Cache = LruCache<CacheKey, (Vec<u8>, Instant)>;
 
@@ -20,11 +22,15 @@ pub async fn init(max_entries: usize) {
         .await;
 }
 
-pub async fn get(qname: &str, qtype: u16, qclass: u16) -> Option<(Vec<u8>, u32)> {
+pub async fn get(query: &QueryInfo) -> Option<(Vec<u8>, u32)> {
     let cache = CACHE.get()?;
     let mut rl = cache.write().await;
     let now = Instant::now();
-    let key = (Arc::from(qname.to_ascii_lowercase()), qtype, qclass);
+    let key = (
+        Arc::from(query.qname.to_ascii_lowercase()),
+        query.qtype,
+        query.qclass,
+    );
 
     if let Some((value, deadline)) = rl.get(&key) {
         if now >= *deadline {
@@ -39,11 +45,15 @@ pub async fn get(qname: &str, qtype: u16, qclass: u16) -> Option<(Vec<u8>, u32)>
     }
 }
 
-pub async fn insert(qname: &str, qtype: u16, qclass: u16, value: Vec<u8>, ttl_seconds: u32) {
+pub async fn insert(query: &QueryInfo, value: Vec<u8>, ttl_seconds: u32) {
     if let Some(lock) = CACHE.get() {
         let mut cache = lock.write().await;
         let deadline = Instant::now() + Duration::from_secs(ttl_seconds as u64);
-        let key = (Arc::from(qname.to_ascii_lowercase()), qtype, qclass);
+        let key = (
+            Arc::from(query.qname.to_ascii_lowercase()),
+            query.qtype,
+            query.qclass,
+        );
         cache.put(key, (value, deadline));
     }
 }
