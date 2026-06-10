@@ -75,23 +75,23 @@ impl QueryInfo {
             qclass: self.qclass,
         }
     }
-}
 
-/// Build a DNS query packet for the given target domain, QTYPE and QCLASS.
-pub fn build_query(query_id: u16, info: &QueryInfo) -> Vec<u8> {
-    let qname = encode_domain_to_labels(&info.qname);
-    let mut buf = Vec::with_capacity(12 + qname.len() + 4);
-    buf.extend_from_slice(&query_id.to_be_bytes());
-    buf.push(0x01); // QR=0, RD=1
-    buf.push(0x00);
-    buf.extend_from_slice(&[0x00, 0x01]); // QDCOUNT=1
-    buf.extend_from_slice(&[0x00, 0x00]);
-    buf.extend_from_slice(&[0x00, 0x00]);
-    buf.extend_from_slice(&[0x00, 0x00]);
-    buf.extend_from_slice(&qname);
-    buf.extend_from_slice(&info.qtype.to_be_bytes());
-    buf.extend_from_slice(&info.qclass.to_be_bytes());
-    buf
+    /// Build a DNS query packet for the given target domain, QTYPE and QCLASS.
+    pub fn build(&self, query_id: u16) -> Vec<u8> {
+        let qname = encode_domain_to_labels(&self.qname);
+        let mut buf = Vec::with_capacity(12 + qname.len() + 4);
+        buf.extend_from_slice(&query_id.to_be_bytes());
+        buf.push(0x01); // QR=0, RD=1
+        buf.push(0x00);
+        buf.extend_from_slice(&[0x00, 0x01]); // QDCOUNT=1
+        buf.extend_from_slice(&[0x00, 0x00]);
+        buf.extend_from_slice(&[0x00, 0x00]);
+        buf.extend_from_slice(&[0x00, 0x00]);
+        buf.extend_from_slice(&qname);
+        buf.extend_from_slice(&self.qtype.to_be_bytes());
+        buf.extend_from_slice(&self.qclass.to_be_bytes());
+        buf
+    }
 }
 
 fn encode_domain_to_labels(domain: &str) -> Vec<u8> {
@@ -176,12 +176,7 @@ pub fn read_domain_name(data: &[u8], mut offset: usize) -> Result<(String, usize
 
 /// Copy a section of DNS resource records, decompressing owner names and
 /// re-encoding them uncompressed to avoid broken compression pointers.
-fn copy_rr_section(
-    buf: &mut Vec<u8>,
-    data: &[u8],
-    mut off: usize,
-    count: u16,
-) -> Result<usize> {
+fn copy_rr_section(buf: &mut Vec<u8>, data: &[u8], mut off: usize, count: u16) -> Result<usize> {
     for _ in 0..count {
         let (name, next) = read_domain_name(data, off)?;
         if next + 10 > data.len() {
@@ -431,39 +426,6 @@ pub fn cap_response_ttl(response: &mut [u8], max_ttl: u32) -> Result<()> {
     }
 
     Ok(())
-}
-
-pub fn build_nxdomain_response(query: &[u8]) -> Result<Vec<u8>> {
-    if query.len() < 12 {
-        bail!("query too short");
-    }
-
-    let qdcount = u16_be(query, 4);
-    let mut offset = 12;
-    for _ in 0..qdcount {
-        offset = skip_name(query, offset)?;
-        offset += 4;
-    }
-    let question = &query[12..offset];
-
-    let total = 12 + question.len();
-    let mut resp = Vec::with_capacity(total);
-
-    resp.extend_from_slice(&query[..2]);
-
-    let rd_bit = query[2] & 0x01;
-    resp.push(0x80 | rd_bit);
-    // RA=1, RCODE=3 (NXDOMAIN)
-    resp.push(0x83);
-
-    resp.extend_from_slice(&[0x00, qdcount as u8]);
-    resp.extend_from_slice(&[0x00, 0x00]);
-    resp.extend_from_slice(&[0x00, 0x00]);
-    resp.extend_from_slice(&[0x00, 0x00]);
-
-    resp.extend_from_slice(question);
-
-    Ok(resp)
 }
 
 pub fn build_empty_response(query: &[u8]) -> Result<Vec<u8>> {

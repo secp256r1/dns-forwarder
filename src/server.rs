@@ -12,7 +12,7 @@ use crate::{
     config::{NftSet, config},
     dns::{
         QueryInfo, Response, analyze_response, build_a_response, build_cname_chase_response,
-        build_empty_response, build_nxdomain_response, build_query, cap_response_ttl,
+        build_empty_response, cap_response_ttl,
     },
     extra_domain, forwarder,
 };
@@ -58,7 +58,7 @@ async fn query_handler(query: &[u8]) -> Result<Vec<u8>> {
 
     if config.blocklist.get(&info.qname).is_some() {
         debug!("private domain or blocklist match: {}", &info.qname);
-        return build_nxdomain_response(query);
+        return build_empty_response(query);
     }
 
     match cache::get(&info).await {
@@ -134,7 +134,7 @@ async fn resolve_with_cname_chase(
         bail!("CNAME resolution exceeded max depth of 10");
     }
 
-    let current_query = build_query(fastrand::u16(..), info);
+    let current_query = info.build(fastrand::u16(..));
     let response = query_from_upstream(&info.qname, &current_query, upstreams).await?;
 
     let (resp, ttl) = analyze_response(&response)?;
