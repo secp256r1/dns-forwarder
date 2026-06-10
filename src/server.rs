@@ -12,7 +12,7 @@ use crate::{
     config::{NftSet, config},
     dns::{
         QueryInfo, Response, analyze_response, build_a_response, build_cname_chase_response,
-        build_nxdomain_response, build_query, cap_response_ttl,
+        build_empty_response, build_nxdomain_response, build_query, cap_response_ttl,
     },
     extra_domain, forwarder,
 };
@@ -85,8 +85,11 @@ async fn query_handler(query: &[u8]) -> Result<Vec<u8>> {
             }
 
             if info.qtype == 28 && rule.map(|i| i.block_aaaa) == Some(true) {
-                debug!("AAAA record detected, returning NXDOMAIN response");
-                return build_nxdomain_response(query);
+                debug!(
+                    "AAAA query {} blocked, returning NOERROR empty response",
+                    info.qname
+                );
+                return build_empty_response(query);
             }
 
             let upstreams = rule.map(|i| &i.upstreams).unwrap_or(&config.default_server);
@@ -190,24 +193,6 @@ fn add_to_nft_set(qname: &str, s: &NftSet, ips: &[Ipv4Addr], timeout_secs: u32) 
             s.set
         );
         return Ok(());
-    }
-
-    for ip in &ips {
-        let delete_out = std::process::Command::new("nft")
-            .arg("delete")
-            .arg("element")
-            .arg(&s.family)
-            .arg(&s.table)
-            .arg(&s.set)
-            .arg(format!("{{ {ip} }}"))
-            .output()?;
-        if !delete_out.status.success() {
-            debug!(
-                "nft delete element '{ip}' from '{}' skipped (not present): {}",
-                s.set,
-                String::from_utf8_lossy(&delete_out.stderr).trim()
-            );
-        }
     }
 
     let elements = ips

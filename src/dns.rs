@@ -466,6 +466,39 @@ pub fn build_nxdomain_response(query: &[u8]) -> Result<Vec<u8>> {
     Ok(resp)
 }
 
+pub fn build_empty_response(query: &[u8]) -> Result<Vec<u8>> {
+    if query.len() < 12 {
+        bail!("query too short");
+    }
+
+    let qdcount = u16_be(query, 4);
+    let mut offset = 12;
+    for _ in 0..qdcount {
+        offset = skip_name(query, offset)?;
+        offset += 4;
+    }
+    let question = &query[12..offset];
+
+    let total = 12 + question.len();
+    let mut resp = Vec::with_capacity(total);
+
+    resp.extend_from_slice(&query[..2]);
+
+    let rd_bit = query[2] & 0x01;
+    resp.push(0x80 | rd_bit);
+    // RA=1, RCODE=0 (NOERROR)
+    resp.push(0x80);
+
+    resp.extend_from_slice(&[0x00, qdcount as u8]);
+    resp.extend_from_slice(&[0x00, 0x00]);
+    resp.extend_from_slice(&[0x00, 0x00]);
+    resp.extend_from_slice(&[0x00, 0x00]);
+
+    resp.extend_from_slice(question);
+
+    Ok(resp)
+}
+
 pub fn build_a_response(query: &[u8], ip: &[u8; 4]) -> Result<Vec<u8>> {
     if query.len() < 12 {
         bail!("query too short");
