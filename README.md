@@ -2,19 +2,21 @@
 
 [中文](README.zh.md)
 
-A high-performance DNS forwarder with rule-based routing, written in Rust.
+A high-performance DNS forwarder with rule-based routing, written in Rust (v0.2.0).
 
 ## Features
 
-- **Typed rules** — Each rule has a `type` that determines its behavior: `forward` (upstream routing), `block` (NXDOMAIN), `local` (static mapping), or `cname` (server-side CNAME chasing).
+- **Typed rules** — Each rule has a `type` that determines its behavior: `forward` (upstream routing), `block` (NXDOMAIN), or `local` (static mapping).
 - **Rule-based upstream routing** — Route DNS queries to different upstream servers based on domain suffix matching. Perfect for split-horizon DNS or directing specific domains through specific resolvers.
 - **Domain blocking** — Return NXDOMAIN for domains matched by `block` rules. Private suffixes (`.lan`, `.local`, `.home.arpa`, `.corp`, `.internal`) are blocked by default.
-- **CNAME chasing** — The `cname` rule type resolves queries by forwarding a rewritten query (targeting a domain from `cname_list`) to the default server, returning the final A/AAAA response directly.
-- **AAAA record blocking** — Optionally block IPv6 (AAAA) responses for domains matched by a `forward` rule, returning an SOA response instead. Useful in IPv4-only networks.
-- **nftables integration** — Automatically add resolved A-record IP addresses to nftables sets, enabling dynamic firewall or policy-routing rules that track DNS resolution results.
-- **DNS caching** — In-memory TTL cache that respects upstream TTL values, with a configurable `max_ttl` cap.
-- **Local domain resolution** — Static host-like mappings for local domains without needing an upstream query.
+- **Automatic CNAME chasing** — All `forward` rules automatically follow CNAME chains (up to 10 deep, with loop detection) and return the final A/AAAA response.
+- **Dynamic CNAME domain learning** — CNAME targets discovered at runtime are dynamically associated with their `forward` rule, so subsequent queries to those targets are routed directly without explicit configuration.
+- **AAAA record blocking** — Optionally block IPv6 (AAAA) responses for domains matched by a `forward` rule, returning an empty response instead. Useful in IPv4-only networks.
+- **nftables integration** — Automatically add resolved A-record IP addresses to nftables sets, enabling dynamic firewall or policy-routing rules. IPs are added with a timeout of `TTL × 2`.
+- **DNS caching** — In-memory LRU cache with configurable `max_entries`, `min_ttl` (floor), and `max_ttl` (cap).
+- **Local domain resolution** — Static host-like mappings for local domains without needing an upstream query. Domain files use `domain = ip` format.
 - **Fast suffix matching** — Uses a trie data structure for efficient domain suffix lookup, handling large domain lists with minimal overhead.
+- **Random upstream selection** — Each query picks a random upstream from the rule's server list, improving load distribution.
 - **Async I/O** — Built on Tokio for high-concurrency UDP processing.
 
 ## Why dns-forwarder
@@ -36,6 +38,7 @@ default_server = ["8.8.8.8", "114.114.114.114"]
 
 [cache]
 max_entries = 100000
+min_ttl = 60
 max_ttl = 3600
 
 # Forward matching domains to specific upstreams
@@ -53,18 +56,11 @@ name = "ads"
 type = "block"
 domain_files = ["domains/ads.txt"]
 
-# Static local domain resolution
+# Static local domain resolution (domain files use "domain = ip" format)
 [[rules]]
 name = "internal"
 type = "local"
 domain_files = ["domains/local.txt"]
-
-# CNAME chasing: resolve queries by rewriting to a target domain
-[[rules]]
-name = "alias"
-type = "cname"
-domain_files = ["domains/alias.txt"]
-cname_list = ["real-server.example.com"]
 ```
 
 #### Field reference
@@ -74,14 +70,38 @@ cname_list = ["real-server.example.com"]
 | `listen` | global | Address and port the forwarder binds to. |
 | `default_server` | global | Default upstream DNS servers (used when no forward rule matches). |
 | `cache.max_entries` | global | Maximum number of cached responses. |
-| `cache.max_ttl` | global | Maximum TTL (seconds) for cached responses. |
+| `cache.min_ttl` | global | Minimum TTL (seconds) for cached responses. Upstream TTLs below this value are raised to this floor. |
+| `cache.max_ttl` | global | Maximum TTL (seconds) for cached responses. Upstream TTLs above this value are capped. |
 | `rules[].name` | all | Optional rule name for logging. |
-| `rules[].type` | all | Rule type: `forward`, `block`, `local`, or `cname`. |
-| `rules[].domain_files` | all | Files containing domain suffixes (one per line), e.g. `google.com` matches `www.google.com`. |
+| `rules[].type` | all | Rule type: `forward`, `block`, or `local`. |
+| `rules[].domain_files` | all | Files containing domain suffixes (one per line, `#` for comments). For `local` rules, use `domain = ip` format per line. |
 | `rules[].upstreams` | `forward` | Upstream servers for domains matching this rule. |
-| `rules[].block_aaaa` | `forward` | If `true`, AAAA responses are replaced with an SOA response for matched domains. |
-| `rules[].nft_set` | `forward` | Optional nftables set spec (`family table set`). A-record IPs from matching domains are added to this set. |
-| `rules[].cname_list` | `cname` | Target domains to rewrite queries to. One is chosen at random per match. |
+| `rules[].block_aaaa` | `forward` | If `true`, AAAA responses are replaced with an empty response for matched domains. |
+| `rules[].nft_set` | `forward` | Optional nftables set spec (`family table set`). A-record IPs from matching domains are added to this set with timeout `TTL × 2`. |
+
+#### Domain file formats
+
+Domain files use plain text (one entry per line, `#` for comments):
+
+- **`forward` / `block` rules** — One domain suffix per line:
+  ```
+  example.com
+  google.com
+  # this is a comment
+  ```
+
+- **`local` rules** — `domain = ip` format (spaces around `=` optional):
+  ```
+  router.lan = 192.168.1.1
+  nas.lan = 192.168.1.100
+  ```
+
+#### CNAME chasing behavior
+
+All `forward` rules automatically follow CNAME chains. When a CNAME response is received, the forwarder:
+1. Follows the CNAME chain up to 10 levels deep (with loop detection).
+2. Returns the final A/AAAA response directly, with the full CNAME chain included.
+3. **Dynamically learns** the CNAME target domain — it is added to a runtime trie and associated with the same `forward` rule. Subsequent queries to that target are routed without needing to appear in any domain file.
 
 #### Private domain blocking
 
