@@ -7,6 +7,7 @@ use crate::config::config;
 const DNS_TYPE_A: u16 = 1;
 const DNS_TYPE_AAAA: u16 = 28;
 const DNS_TYPE_CNAME: u16 = 5;
+const DNS_TYPE_OPT: u16 = 41;
 const DNS_CLASS_IN: u16 = 1;
 
 pub struct QueryInfo {
@@ -79,17 +80,23 @@ impl QueryInfo {
     /// Build a DNS query packet for the given target domain, QTYPE and QCLASS.
     pub fn build(&self, query_id: u16) -> Vec<u8> {
         let qname = encode_domain_to_labels(&self.qname);
-        let mut buf = Vec::with_capacity(12 + qname.len() + 4);
+        // OPT pseudo-record: root(1) + type(2) + class/plen(2) + ext_rcode(1) + ver(1) + flags(2) + rdlen(2) = 11
+        let mut buf = Vec::with_capacity(12 + qname.len() + 4 + 11);
         buf.extend_from_slice(&query_id.to_be_bytes());
         buf.push(0x01); // QR=0, RD=1
         buf.push(0x00);
         buf.extend_from_slice(&[0x00, 0x01]); // QDCOUNT=1
-        buf.extend_from_slice(&[0x00, 0x00]);
-        buf.extend_from_slice(&[0x00, 0x00]);
-        buf.extend_from_slice(&[0x00, 0x00]);
+        buf.extend_from_slice(&[0x00, 0x00]); // ANCOUNT=0
+        buf.extend_from_slice(&[0x00, 0x00]); // NSCOUNT=0
+        buf.extend_from_slice(&[0x00, 0x01]); // ARCOUNT=1 (OPT)
         buf.extend_from_slice(&qname);
         buf.extend_from_slice(&self.qtype.to_be_bytes());
         buf.extend_from_slice(&self.qclass.to_be_bytes());
+        buf.push(0x00); // OPT owner name = root
+        buf.extend_from_slice(&DNS_TYPE_OPT.to_be_bytes());
+        buf.extend_from_slice(&1232u16.to_be_bytes()); // UDP payload size
+        buf.extend_from_slice(&[0x00, 0x00, 0x00, 0x00]); // ext RCODE, version, flags
+        buf.extend_from_slice(&0u16.to_be_bytes()); // RDLEN=0
         buf
     }
 }
