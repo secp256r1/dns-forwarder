@@ -92,10 +92,11 @@ async fn query_handler(query: &[u8]) -> Result<Vec<u8>> {
                 return build_empty_response(query);
             }
 
-            let upstreams = rule.map(|i| &i.upstreams).unwrap_or(&config.default_server);
-            let ecs = rule
-                .and_then(|r| r.edns_client_subnet.as_ref())
-                .or(config.edns_client_subnet.as_ref());
+            let (upstreams, ecs) = match rule.map(|i| &i.upstreams) {
+                Some(upstreams) => (upstreams, rule.and_then(|r| r.edns_client_subnet.as_ref())),
+                None => (&config.default_server, config.edns_client_subnet.as_ref()),
+            };
+
             let (r, resp, ttl) = resolve_with_cname_chase(
                 &info,
                 query,
