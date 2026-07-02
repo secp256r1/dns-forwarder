@@ -9,7 +9,7 @@ use tokio::net::UdpSocket;
 
 use crate::{
     cache,
-    config::{NftSet, config},
+    config::{ClientSubnet, NftSet, config},
     dns::{
         QueryInfo, Response, analyze_response, build_a_response, build_cname_chase_response,
         build_empty_response, cap_response_ttl,
@@ -93,11 +93,15 @@ async fn query_handler(query: &[u8]) -> Result<Vec<u8>> {
             }
 
             let upstreams = rule.map(|i| &i.upstreams).unwrap_or(&config.default_server);
+            let ecs = rule
+                .and_then(|r| r.edns_client_subnet.as_ref())
+                .or(config.edns_client_subnet.as_ref());
             let (r, resp, ttl) = resolve_with_cname_chase(
                 &info,
                 query,
                 upstreams,
                 rule.map(|i| i.id),
+                ecs,
                 Vec::new(),
                 0,
             )
@@ -127,6 +131,7 @@ async fn resolve_with_cname_chase(
     original_query: &[u8],
     upstreams: &[SocketAddr],
     rule_id: Option<usize>,
+    ecs: Option<&ClientSubnet>,
     mut cname_chain: Vec<(String, u32)>,
     depth: usize,
 ) -> Result<(Vec<u8>, Response, u32)> {
@@ -134,7 +139,7 @@ async fn resolve_with_cname_chase(
         bail!("CNAME resolution exceeded max depth of 10");
     }
 
-    let current_query = info.build(fastrand::u16(..));
+    let current_query = info.build(fastrand::u16(..), ecs);
     let response = query_from_upstream(&info.qname, &current_query, upstreams).await?;
 
     let (resp, ttl) = analyze_response(&response)?;
@@ -163,6 +168,7 @@ async fn resolve_with_cname_chase(
                 original_query,
                 upstreams,
                 rule_id,
+                ecs,
                 cname_chain,
                 depth + 1,
             ))

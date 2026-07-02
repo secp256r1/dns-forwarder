@@ -1,8 +1,8 @@
-use std::net::Ipv4Addr;
+use std::net::{IpAddr, Ipv4Addr};
 
 use anyhow::{Result, bail};
 
-use crate::config::config;
+use crate::config::{ClientSubnet, config};
 
 const DNS_TYPE_A: u16 = 1;
 const DNS_TYPE_AAAA: u16 = 28;
@@ -77,19 +77,27 @@ impl QueryInfo {
     }
 
     /// Build a DNS query packet for the given target domain, QTYPE and QCLASS.
-    pub fn build(&self, query_id: u16) -> Vec<u8> {
+    /// If `ecs` is provided, an EDNS0 OPT pseudo-record with the client subnet
+    /// option is appended and ARCOUNT is set to 1.
+    pub fn build(&self, query_id: u16, ecs: Option<&ClientSubnet>) -> Vec<u8> {
         let qname = encode_domain_to_labels(&self.qname);
-        let mut buf = Vec::with_capacity(12 + qname.len() + 4);
+        let opt_record = ecs.map(|e| build_edns0_opt_record(e.ip, e.prefix_len));
+        let opt_len = opt_record.as_ref().map_or(0, |o| o.len());
+
+        let mut buf = Vec::with_capacity(12 + qname.len() + 4 + opt_len);
         buf.extend_from_slice(&query_id.to_be_bytes());
         buf.push(0x01); // QR=0, RD=1
         buf.push(0x00);
         buf.extend_from_slice(&[0x00, 0x01]); // QDCOUNT=1
-        buf.extend_from_slice(&[0x00, 0x00]);
-        buf.extend_from_slice(&[0x00, 0x00]);
-        buf.extend_from_slice(&[0x00, 0x00]);
+        buf.extend_from_slice(&[0x00, 0x00]); // ANCOUNT=0
+        buf.extend_from_slice(&[0x00, 0x00]); // NSCOUNT=0
+        buf.extend_from_slice(if ecs.is_some() { &[0x00, 0x01] } else { &[0x00, 0x00] }); // ARCOUNT
         buf.extend_from_slice(&qname);
         buf.extend_from_slice(&self.qtype.to_be_bytes());
         buf.extend_from_slice(&self.qclass.to_be_bytes());
+        if let Some(opt) = opt_record {
+            buf.extend_from_slice(&opt);
+        }
         buf
     }
 }
@@ -105,6 +113,44 @@ fn encode_domain_to_labels(domain: &str) -> Vec<u8> {
     }
     encoded.push(0x00);
     encoded
+}
+
+/// Build an EDNS0 OPT pseudo-record containing an EDNS Client Subnet (ECS)
+/// option (option code 8). The address is truncated to the given prefix length.
+fn build_edns0_opt_record(ip: IpAddr, prefix_len: u8) -> Vec<u8> {
+    let ecs_data = match ip {
+        IpAddr::V4(ip) => {
+            let octets = ip.octets();
+            let addr_bytes = prefix_len.div_ceil(8).min(4) as usize;
+            let mut data = Vec::with_capacity(4 + addr_bytes);
+            data.extend_from_slice(&[0x00, 0x01]); // address family = IPv4
+            data.push(prefix_len); // SOURCE PREFIX-LENGTH
+            data.push(0x00); // SCOPE PREFIX-LENGTH = 0 (query)
+            data.extend_from_slice(&octets[..addr_bytes]);
+            data
+        }
+        IpAddr::V6(ip) => {
+            let octets = ip.octets();
+            let addr_bytes = prefix_len.div_ceil(8).min(16) as usize;
+            let mut data = Vec::with_capacity(4 + addr_bytes);
+            data.extend_from_slice(&[0x00, 0x02]); // address family = IPv6
+            data.push(prefix_len);
+            data.push(0x00);
+            data.extend_from_slice(&octets[..addr_bytes]);
+            data
+        }
+    };
+
+    let mut opt = Vec::with_capacity(11 + ecs_data.len());
+    opt.push(0x00); // NAME = root label
+    opt.extend_from_slice(&[0x00, 0x29]); // TYPE = OPT (41)
+    opt.extend_from_slice(&[0x04, 0xD0]); // UDP payload size = 1232
+    opt.extend_from_slice(&[0x00, 0x00, 0x00, 0x00]); // EXT RCODE, VERSION, FLAGS
+    opt.extend_from_slice(&((4 + ecs_data.len()) as u16).to_be_bytes()); // RDLEN
+    opt.extend_from_slice(&[0x00, 0x08]); // Option Code = ECS (8)
+    opt.extend_from_slice(&(ecs_data.len() as u16).to_be_bytes()); // Option Length
+    opt.extend_from_slice(&ecs_data);
+    opt
 }
 
 pub enum Response {

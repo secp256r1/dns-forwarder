@@ -5,6 +5,12 @@ use std::{
     sync::OnceLock,
 };
 
+#[derive(Clone, Debug)]
+pub struct ClientSubnet {
+    pub ip: IpAddr,
+    pub prefix_len: u8,
+}
+
 use anyhow::{Context, Result, anyhow, bail};
 use log::info;
 use serde::Deserialize;
@@ -23,12 +29,14 @@ struct RawConfig {
     pub default_server: Vec<String>,
     pub rules: Vec<RuleConfig>,
     pub cache: Option<CacheConfig>,
+    pub edns_client_subnet: Option<String>,
 }
 
 #[derive(Deserialize, Clone)]
 pub struct RuleConfig {
     pub name: Option<String>,
     pub domain_files: Vec<String>,
+    pub edns_client_subnet: Option<String>,
     #[serde(flatten)]
     pub kind: RuleKind,
 }
@@ -63,6 +71,7 @@ pub struct ForwardRule {
     pub upstreams: Vec<SocketAddr>,
     pub block_aaaa: bool,
     pub nft_set: Option<NftSet>,
+    pub edns_client_subnet: Option<ClientSubnet>,
 }
 
 #[derive(Clone)]
@@ -134,6 +143,7 @@ pub struct Config {
     pub forward_rules: Vec<ForwardRule>,
     pub local_domains: DomainTrie<Ipv4Addr>,
     pub blocklist: DomainTrie<()>,
+    pub edns_client_subnet: Option<ClientSubnet>,
 }
 
 impl Config {
@@ -220,6 +230,11 @@ impl Config {
                         upstreams,
                         block_aaaa: *block_aaaa,
                         nft_set,
+                        edns_client_subnet: rule
+                            .edns_client_subnet
+                            .as_ref()
+                            .map(|s| parse_client_subnet(s))
+                            .transpose()?,
                     });
                 }
                 RuleKind::Block => {
@@ -258,6 +273,11 @@ impl Config {
             cache: config.cache.unwrap_or_default(),
             local_domains,
             blocklist,
+            edns_client_subnet: config
+                .edns_client_subnet
+                .as_ref()
+                .map(|s| parse_client_subnet(s))
+                .transpose()?,
         })
     }
 }
@@ -270,6 +290,20 @@ fn parse_dns_server_addr(s: &str) -> Result<SocketAddr> {
             Err(_) => bail!("invalid dns server addr"),
         },
     })
+}
+
+fn parse_client_subnet(s: &str) -> Result<ClientSubnet> {
+    let (ip_str, prefix_str) = s
+        .split_once('/')
+        .ok_or_else(|| anyhow!("invalid edns_client_subnet '{s}', expected format 'ip/prefix'"))?;
+    let ip: IpAddr = ip_str.parse()?;
+    let prefix_len: u8 = prefix_str.parse()?;
+    match ip {
+        IpAddr::V4(_) if prefix_len > 32 => bail!("IPv4 prefix length must be <= 32"),
+        IpAddr::V6(_) if prefix_len > 128 => bail!("IPv6 prefix length must be <= 128"),
+        _ => {}
+    }
+    Ok(ClientSubnet { ip, prefix_len })
 }
 
 enum DomainFileKind {
