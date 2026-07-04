@@ -114,10 +114,8 @@ async fn query_handler(query: &[u8]) -> Result<Vec<u8>> {
             {
                 let qname = info.qname.clone();
                 let records = a_records.clone();
-                tokio::task::spawn_blocking(move || {
-                    add_to_nft_set(&qname, &set, &records, ttl * 2)
-                })
-                .await??;
+                tokio::task::spawn_blocking(move || add_to_nft_set(&qname, &set, &records))
+                    .await??;
             }
 
             let r = &r[2..];
@@ -191,7 +189,7 @@ async fn query_from_upstream(
         .await
 }
 
-fn add_to_nft_set(qname: &str, s: &NftSet, ips: &[Ipv4Addr], timeout_secs: u32) -> Result<()> {
+fn add_to_nft_set(qname: &str, s: &NftSet, ips: &[Ipv4Addr]) -> Result<()> {
     let ips: Vec<_> = ips.iter().filter(|ip| !s.contains(ip)).collect();
 
     if ips.is_empty() {
@@ -204,7 +202,7 @@ fn add_to_nft_set(qname: &str, s: &NftSet, ips: &[Ipv4Addr], timeout_secs: u32) 
 
     let elements = ips
         .iter()
-        .map(|ip| format!("{ip} timeout {timeout_secs}s"))
+        .map(|ip| ip.to_string())
         .collect::<Vec<_>>()
         .join(", ");
 
