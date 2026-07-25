@@ -52,19 +52,19 @@ async fn query_handler(query: &[u8]) -> Result<Vec<u8>> {
     let config = config()?;
 
     if let Some(ip) = config.local_domains.get(&info.qname) {
-        debug!("local domain match: {} -> {ip}", &info.qname);
+        debug!("local domain match: {} -> {ip}", info.qname);
         return build_a_response(query, &ip.octets());
     }
 
     if config.blocklist.get(&info.qname).is_some() {
-        debug!("private domain or blocklist match: {}", &info.qname);
+        debug!("private domain or blocklist match: {}", info.qname);
         return build_empty_response(query);
     }
 
     match cache::get(&info).await {
         Some((cached, remaining_ttl)) => {
             let mut response = [query_id, &cached].concat();
-            debug!("cache {} ttl {remaining_ttl}", &info.qname);
+            debug!("cache {} ttl {remaining_ttl}", info.qname);
             cap_response_ttl(&mut response, remaining_ttl)?;
             Ok(response)
         }

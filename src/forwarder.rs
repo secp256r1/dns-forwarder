@@ -1,19 +1,24 @@
-use std::{collections::HashMap, net::SocketAddr, sync::Arc};
+use std::{
+    collections::HashMap,
+    net::SocketAddr,
+    sync::Arc,
+};
 
 use anyhow::{Result, bail};
-use log::error;
+use log::{error, warn};
 use tokio::{
     net::UdpSocket,
-    sync::{OnceCell, RwLock, broadcast, mpsc},
-    time::{Duration, timeout},
+    sync::{OnceCell, RwLock, mpsc, oneshot},
+    time::{Duration, Instant, timeout},
 };
+
+type PendingMap = Arc<RwLock<HashMap<u16, (oneshot::Sender<Vec<u8>>, Instant)>>>;
 
 static FORWARDER: OnceCell<Arc<RwLock<HashMap<SocketAddr, Forwarder>>>> = OnceCell::const_new();
 
 #[derive(Clone)]
 pub struct Forwarder {
-    send: mpsc::Sender<Vec<u8>>,
-    recv: broadcast::Sender<Vec<u8>>,
+    send: mpsc::Sender<(Vec<u8>, oneshot::Sender<Vec<u8>>)>,
 }
 
 impl Forwarder {
@@ -23,22 +28,12 @@ impl Forwarder {
         qname: &str,
         upstream: &SocketAddr,
     ) -> Result<Vec<u8>> {
-        let mut recv = self.recv.subscribe();
-        self.send.send(query.to_vec()).await?;
-        match timeout(Duration::from_secs(5), async {
-            loop {
-                let result = recv.recv().await?;
-                if result[..2] == query[..2] {
-                    break Ok(result);
-                }
-            }
-        })
-        .await
-        {
-            Ok(r) => r,
-            Err(_) => {
-                bail!("get {qname} result from forwarder {upstream} timed out");
-            }
+        let (tx, rx) = oneshot::channel();
+        self.send.send((query.to_vec(), tx)).await?;
+        match timeout(Duration::from_secs(5), rx).await {
+            Ok(Ok(result)) => Ok(result),
+            Ok(Err(_)) => bail!("get {qname} result from forwarder {upstream} cancelled"),
+            Err(_) => bail!("get {qname} result from forwarder {upstream} timed out"),
         }
     }
 }
@@ -59,30 +54,46 @@ pub async fn get(remote_addr: &SocketAddr) -> Result<Forwarder> {
                     drop(read_guard);
 
                     let remote_addr = *remote_addr;
-                    let (send, sender_recv) = mpsc::channel(1000);
-                    let (recv, _) = broadcast::channel(1000);
-                    let socket_channel = Forwarder { send, recv };
+                    let (send, sender_recv) =
+                        mpsc::channel::<(Vec<u8>, oneshot::Sender<Vec<u8>>)>(1000);
 
                     let socket = UdpSocket::bind("0.0.0.0:0").await?;
                     socket.connect(remote_addr).await?;
                     let socket = Arc::new(socket);
-                    let socket_recv = socket.clone();
 
+                    let pending: PendingMap = Arc::new(RwLock::new(HashMap::new()));
+                    let pending_ttl = Duration::from_secs(5);
+
+                    // Sender task: reads from mpsc, sends to UDP, registers pending oneshot
+                    let sender_socket = socket.clone();
+                    let sender_pending = pending.clone();
                     tokio::task::spawn(async move {
-                        let mut sender_recv = sender_recv;
+                        let mut recv = sender_recv;
                         loop {
-                            if let Some(query) = sender_recv.recv().await
-                                && let Err(e) = socket_recv.send(&query).await
-                            {
-                                error!("send to {remote_addr} error: {e}");
+                            if let Some((query, resp_tx)) = recv.recv().await {
+                                if query.len() < 2 {
+                                    continue;
+                                }
+                                let query_id =
+                                    u16::from_be_bytes([query[0], query[1]]);
+                                {
+                                    let mut map = sender_pending.write().await;
+                                    map.retain(|_, (_, deadline)| *deadline > Instant::now());
+                                    map.insert(query_id, (resp_tx, Instant::now() + pending_ttl));
+                                }
+                                if let Err(e) = sender_socket.send(&query).await {
+                                    error!("send to {remote_addr} error: {e}");
+                                    sender_pending.write().await.remove(&query_id);
+                                }
                             }
                         }
                     });
 
-                    let send_socket_channel = socket_channel.clone();
+                    // Receiver task: reads from UDP, routes response to the matching oneshot sender
+                    let receiver_pending = pending;
                     tokio::task::spawn(async move {
+                        let mut buf = [0u8; 4096];
                         loop {
-                            let mut buf = [0u8; 4096];
                             let r = match socket.recv(&mut buf).await {
                                 Ok(len) => buf[..len].to_vec(),
                                 Err(e) => {
@@ -90,11 +101,19 @@ pub async fn get(remote_addr: &SocketAddr) -> Result<Forwarder> {
                                     continue;
                                 }
                             };
-                            if let Err(e) = send_socket_channel.recv.send(r) {
-                                error!("send recv result from {remote_addr} error: {e}");
+                            if r.len() < 2 {
+                                continue;
+                            }
+                            let query_id = u16::from_be_bytes([r[0], r[1]]);
+                            if let Some((tx, _)) = receiver_pending.write().await.remove(&query_id)
+                                && tx.send(r).is_err()
+                            {
+                                warn!("response for {remote_addr} query 0x{query_id:04x} arrived after timeout");
                             }
                         }
                     });
+
+                    let socket_channel = Forwarder { send };
 
                     let mut write_guard = forwarder.write().await;
                     write_guard.insert(remote_addr, socket_channel.clone());
