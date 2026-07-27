@@ -183,10 +183,7 @@ async fn query_from_upstream(
 ) -> Result<Vec<u8>> {
     let upstream = fastrand::choice(upstreams).ok_or_else(|| anyhow!("invalid upstreams"))?;
     debug!("query {qname} from {upstream}");
-    forwarder::get(upstream)
-        .await?
-        .forward(query, qname, upstream)
-        .await
+    forwarder::get(upstream).await?.forward(query, qname).await
 }
 
 fn add_to_nft_set(qname: &str, s: &NftSet, ips: &[Ipv4Addr]) -> Result<()> {
