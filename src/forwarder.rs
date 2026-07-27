@@ -63,34 +63,49 @@ pub async fn get(remote_addr: &SocketAddr) -> Result<Forwarder> {
 
                     let pending: PendingMap = Arc::new(RwLock::new(HashMap::new()));
                     let pending_ttl = Duration::from_secs(5);
+                    let shutdown = Arc::new(tokio::sync::Notify::new());
 
                     // Sender task: reads from mpsc, sends to UDP, registers pending oneshot
                     let sender_socket = socket.clone();
                     let sender_pending = pending.clone();
+                    let sender_shutdown = shutdown.clone();
                     tokio::task::spawn(async move {
                         let mut recv = sender_recv;
                         loop {
-                            if let Some((query, resp_tx)) = recv.recv().await {
-                                if query.len() < 2 {
-                                    continue;
-                                }
-                                let query_id =
-                                    u16::from_be_bytes([query[0], query[1]]);
-                                {
-                                    let mut map = sender_pending.write().await;
-                                    map.retain(|_, (_, deadline)| *deadline > Instant::now());
-                                    map.insert(query_id, (resp_tx, Instant::now() + pending_ttl));
-                                }
-                                if let Err(e) = sender_socket.send(&query).await {
-                                    error!("send to {remote_addr} error: {e}");
-                                    sender_pending.write().await.remove(&query_id);
+                            tokio::select! {
+                                biased;
+                                _ = sender_shutdown.notified() => break,
+                                msg = recv.recv() => match msg {
+                                    Some((query, resp_tx)) => {
+                                        if query.len() < 2 {
+                                            continue;
+                                        }
+                                        let query_id =
+                                            u16::from_be_bytes([query[0], query[1]]);
+                                        {
+                                            let mut map = sender_pending.write().await;
+                                            map.retain(|_, (_, deadline)| *deadline > Instant::now());
+                                            map.insert(query_id, (resp_tx, Instant::now() + pending_ttl));
+                                        }
+                                        if let Err(e) = sender_socket.send(&query).await {
+                                            error!("send to {remote_addr} error: {e}");
+                                            sender_pending.write().await.remove(&query_id);
+                                        }
+                                    }
+                                    None => break,
                                 }
                             }
+                        }
+                        // Channel closed or shutdown: drop pending waiters so receivers don't hang.
+                        let map = std::mem::take(&mut *sender_pending.write().await);
+                        for (_, (tx, _)) in map {
+                            let _ = tx.send(Vec::new());
                         }
                     });
 
                     // Receiver task: reads from UDP, routes response to the matching oneshot sender
                     let receiver_pending = pending;
+                    let receiver_shutdown = shutdown.clone();
                     tokio::task::spawn(async move {
                         let mut buf = [0u8; 4096];
                         loop {
@@ -98,7 +113,7 @@ pub async fn get(remote_addr: &SocketAddr) -> Result<Forwarder> {
                                 Ok(len) => buf[..len].to_vec(),
                                 Err(e) => {
                                     error!("recv from {remote_addr} error: {e}");
-                                    continue;
+                                    break;
                                 }
                             };
                             if r.len() < 2 {
@@ -110,6 +125,12 @@ pub async fn get(remote_addr: &SocketAddr) -> Result<Forwarder> {
                             {
                                 warn!("response for {remote_addr} query 0x{query_id:04x} arrived after timeout");
                             }
+                        }
+                        // Socket closed: notify sender to exit and drop pending waiters.
+                        receiver_shutdown.notify_waiters();
+                        let map = std::mem::take(&mut *receiver_pending.write().await);
+                        for (_, (tx, _)) in map {
+                            let _ = tx.send(Vec::new());
                         }
                     });
 
