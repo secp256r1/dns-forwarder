@@ -3,17 +3,21 @@ use std::{
     time::{Duration, Instant},
 };
 
+use anyhow::Result;
 use lru::LruCache;
 use tokio::sync::{OnceCell, RwLock};
 
-use crate::dns::QueryInfo;
+use crate::{config, dns::QueryInfo};
 
 type CacheKey = (Arc<str>, u16, u16);
 type Cache = LruCache<CacheKey, (Vec<u8>, Instant)>;
 
 static CACHE: OnceCell<RwLock<Cache>> = OnceCell::const_new();
 
-pub async fn init(max_entries: usize) {
+pub async fn init() -> Result<()> {
+    let config = config::config()?;
+    let max_entries = config.cache.max_entries;
+
     CACHE
         .get_or_init(|| async {
             RwLock::new(LruCache::new(
@@ -21,6 +25,8 @@ pub async fn init(max_entries: usize) {
             ))
         })
         .await;
+
+    Ok(())
 }
 
 fn key(query: &QueryInfo) -> (Arc<str>, u16, u16) {
