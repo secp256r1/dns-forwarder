@@ -12,6 +12,7 @@ A high-performance DNS forwarder with rule-based routing, written in Rust (v0.2.
 - **Automatic CNAME chasing** — All `forward` rules automatically follow CNAME chains (up to 10 deep, with loop detection) and return the final A/AAAA response.
 - **Dynamic CNAME domain learning** — CNAME targets discovered at runtime are dynamically associated with their `forward` rule, so subsequent queries to those targets are routed directly without explicit configuration.
 - **AAAA record blocking** — Optionally block IPv6 (AAAA) responses for domains matched by a `forward` rule, returning an empty response instead. Useful in IPv4-only networks.
+- **EDNS Client Subnet (ECS)** — Optionally attach an EDNS0 client subnet option (option code 8) to outgoing queries, either globally or per-rule. Useful for geo-aware DNS resolution and CDN traffic optimization.
 - **nftables integration** — Automatically add resolved A-record IP addresses to nftables sets, enabling dynamic firewall or policy-routing rules. IPs are added with a timeout of `TTL × 2`.
 - **DNS caching** — In-memory LRU cache with configurable `max_entries`, `min_ttl` (floor), and `max_ttl` (cap).
 - **Local domain resolution** — Static host-like mappings for local domains without needing an upstream query. Domain files use `domain = ip` format.
@@ -41,6 +42,9 @@ max_entries = 100000
 min_ttl = 60
 max_ttl = 3600
 
+# Optional: attach EDNS client subnet to all default upstream queries
+edns_client_subnet = "1.2.3.4/23"
+
 # Forward matching domains to specific upstreams
 [[rules]]
 name = "gfw"
@@ -49,6 +53,7 @@ domain_files = ["domains/gfw.txt"]
 upstreams = ["1.1.1.1"]
 block_aaaa = true
 nft_set = "inet fw xip"
+edns_client_subnet = "1.2.3.4/23"  # per-rule ECS, overrides global value for this rule
 
 # Return NXDOMAIN for matching domains
 [[rules]]
@@ -78,6 +83,8 @@ domain_files = ["domains/local.txt"]
 | `rules[].upstreams` | `forward` | Upstream servers for domains matching this rule. |
 | `rules[].block_aaaa` | `forward` | If `true`, AAAA responses are replaced with an empty response for matched domains. |
 | `rules[].nft_set` | `forward` | Optional nftables set spec (`family table set`). A-record IPs from matching domains are added to this set with timeout `TTL × 2`. |
+| `rules[].edns_client_subnet` | `forward` | Optional per-rule EDNS client subnet (`ip/prefix_len`). Overrides the global `edns_client_subnet` for this rule. When neither is set, no ECS option is appended. |
+| `edns_client_subnet` | global | Optional global EDNS client subnet (`ip/prefix_len`). Applied to all default upstream queries and used as fallback when a `forward` rule does not specify its own. |
 
 #### Domain file formats
 
@@ -102,6 +109,21 @@ All `forward` rules automatically follow CNAME chains. When a CNAME response is 
 1. Follows the CNAME chain up to 10 levels deep (with loop detection).
 2. Returns the final A/AAAA response directly, with the full CNAME chain included.
 3. **Dynamically learns** the CNAME target domain — it is added to a runtime trie and associated with the same `forward` rule. Subsequent queries to that target are routed without needing to appear in any domain file.
+
+#### EDNS Client Subnet
+
+Both a global `edns_client_subnet` and per-rule `rules[].edns_client_subnet` are supported.
+
+- **Global** (`edns_client_subnet = "1.2.3.4/23"` on the top level) — applied to all queries sent to the `default_server` upstreams, and used as a fallback when a `forward` rule has no per-rule ECS.
+- **Per-rule** (`rules[].edns_client_subnet = "1.2.3.4/23"` on a forward rule) — overrides the global ECS for that specific rule, allowing different client subnets for different upstream groups.
+
+When an ECS value is set (global or per-rule), an **EDNS0 OPT pseudo-record** with option code 8 (EDNS Client Subnet) is appended to the outgoing query. The IP and prefix length determine how much of the client's address is disclosed:
+
+- `"0.0.0.0/0"` — no client address disclosed (privacy mode).
+- `"1.2.3.4/32"` — full address disclosed (maximum geo-accuracy).
+- `"1.2.3.4/24"` — /24 subnet disclosed (balance between privacy and geo-location).
+
+The format is `ip/prefix_len`, supporting both IPv4 (prefix ≤ 32) and IPv6 (prefix ≤ 128).
 
 #### Private domain blocking
 

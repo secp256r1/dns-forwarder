@@ -12,6 +12,7 @@
 - **自动 CNAME 追踪** — 所有 `forward` 规则会自动跟随 CNAME 链（最多 10 层，含循环检测）并返回最终的 A/AAAA 结果。
 - **动态 CNAME 域名学习** — 运行时发现的 CNAME 目标域名会自动关联到对应的 `forward` 规则，后续对该域名的查询无需显式配置即可命中同一规则。
 - **AAAA 记录屏蔽** — 可对 `forward` 规则匹配的域名屏蔽 IPv6（AAAA）响应，返回空响应。适用于纯 IPv4 网络环境。
+- **EDNS Client Subnet（ECS）** — 支持在全局或规则级别附加 EDNS0 客户端子网选项（选项码 8），用于 geo-aware DNS 解析和 CDN 流量优化。
 - **nftables 集成** — 自动将解析得到的 A 记录 IP 地址添加到 nftables 集合中，IP 超时时间为 `TTL × 2`。
 - **DNS 缓存** — 内存 LRU 缓存，支持 `max_entries`、`min_ttl`（下限）和 `max_ttl`（上限）配置。
 - **本地域名解析** — 支持静态 hosts 式映射，无需上游查询即可解析本地域名。域名文件使用 `domain = ip` 格式。
@@ -41,6 +42,9 @@ max_entries = 100000
 min_ttl = 60
 max_ttl = 3600
 
+# 可选：为所有默认上游查询附加 EDNS 客户端子网
+edns_client_subnet = "1.2.3.4/23"
+
 # 将匹配的域名转发到特定上游
 [[rules]]
 name = "gfw"
@@ -49,6 +53,7 @@ domain_files = ["domains/gfw.txt"]
 upstreams = ["1.1.1.1"]
 block_aaaa = true
 nft_set = "inet fw xip"
+edns_client_subnet = "1.2.3.4/23"  # 规则级别 ECS，覆盖全局设置
 
 # 对匹配的域名返回 NXDOMAIN
 [[rules]]
@@ -78,6 +83,8 @@ domain_files = ["domains/local.txt"]
 | `rules[].upstreams` | `forward` | 匹配该规则的域名使用的上游服务器。 |
 | `rules[].block_aaaa` | `forward` | 若为 `true`，对匹配的域名将 AAAA 响应替换为空响应。 |
 | `rules[].nft_set` | `forward` | 可选的 nftables 集合描述（格式为 `family table set`）。匹配域名的 A 记录 IP 会被添加到该集合中，超时时间为 `TTL × 2`。 |
+| `rules[].edns_client_subnet` | `forward` | 可选的规则级别 EDNS 客户端子网（`ip/前缀长度`）。覆盖全局 `edns_client_subnet`。若两者都未设置，则不附加 ECS 选项。 |
+| `edns_client_subnet` | 全局 | 可选的全局 EDNS 客户端子网（`ip/前缀长度`）。应用于所有默认上游查询，并在 `forward` 规则未指定自己的 ECS 时作为回退。 |
 
 #### 域名文件格式
 
@@ -102,6 +109,21 @@ domain_files = ["domains/local.txt"]
 1. 跟随 CNAME 链，最多追踪 10 层（含循环检测）。
 2. 直接返回最终的 A/AAAA 响应，并在响应中包含完整的 CNAME 链。
 3. **动态学习** CNAME 目标域名——将其加入运行时 trie 并与同一 `forward` 规则关联。后续对该目标域名的查询无需出现在任何域名文件中即可命中该规则。
+
+#### EDNS Client Subnet
+
+支持全局 `edns_client_subnet` 和规则级别的 `rules[].edns_client_subnet`。
+
+- **全局**（顶级 `edns_client_subnet = "1.2.3.4/23"`）—— 应用于发送到 `default_server` 上游的所有查询，并在 `forward` 规则未设置自己的 ECS 时作为回退。
+- **规则级别**（`forward` 规则中的 `edns_client_subnet = "1.2.3.4/23"`）—— 覆盖该规则的全局 ECS，允许为不同的上游组使用不同的客户端子网。
+
+设置 ECS 值后（全局或规则级别），会在发出的查询中附加一个 **EDNS0 OPT 伪记录**，选项码为 8（EDNS Client Subnet）。IP 和前缀长度决定披露多少客户端地址信息：
+
+- `"0.0.0.0/0"` — 不披露客户端地址（隐私模式）。
+- `"1.2.3.4/32"` — 完整地址（最大地理精度）。
+- `"1.2.3.4/24"` — /24 子网（隐私与地理定位之间的平衡）。
+
+格式为 `ip/前缀长度`，同时支持 IPv4（前缀 ≤ 32）和 IPv6（前缀 ≤ 128）。
 
 #### 私有域名拦截
 
