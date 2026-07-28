@@ -182,8 +182,8 @@ dependencies = [
 
 [[package]]
 name = "nft-set-elem"
-version = "0.1.0"
-source = "git+https://github.com/secp256r1/nft-set-elem#579f87c35379b22341916266cc65ae0c5f48d23a"
+version = "0.2.0"
+source = "git+https://github.com/secp256r1/nft-set-elem#d77bdb65a6dbf4c9f32ef1da51396d372cb9407b"
 dependencies = [
  "bytes",
  "netlink-sys",

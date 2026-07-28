@@ -1,4 +1,4 @@
-use std::net::{IpAddr, Ipv4Addr};
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 
 use anyhow::{Result, bail};
 
@@ -21,48 +21,14 @@ impl QueryInfo {
             bail!("query too short");
         }
 
-        let mut offset = 12;
-        let mut labels = Vec::new();
-        let mut jumped = false;
-        let mut end_offset = offset;
-
-        loop {
-            if offset >= data.len() {
-                bail!("name extends past end of packet");
-            }
-            let len = data[offset];
-            if len == 0 {
-                if !jumped {
-                    end_offset = offset + 1;
-                }
-                break;
-            }
-            if len & 0xC0 == 0xC0 {
-                if offset + 1 >= data.len() {
-                    bail!("compression pointer truncated");
-                }
-                let pointer = u16::from_be_bytes([data[offset], data[offset + 1]]) & 0x3FFF;
-                if !jumped {
-                    end_offset = offset + 2;
-                    jumped = true;
-                }
-                offset = pointer as usize;
-            } else {
-                offset += 1;
-                if offset + len as usize > data.len() {
-                    bail!("label extends past end of packet");
-                }
-                labels.push(std::str::from_utf8(&data[offset..offset + len as usize])?.to_string());
-                offset += len as usize;
-            }
-        }
+        let (qname, end_offset) = parse_name(data, 12)?;
 
         if end_offset + 4 > data.len() {
             bail!("query truncated");
         }
 
         Ok(QueryInfo {
-            qname: labels.join("."),
+            qname,
             qtype: u16_be(data, end_offset),
             qclass: u16_be(data, end_offset + 2),
         })
@@ -155,7 +121,7 @@ fn build_edns0_opt_record(ip: IpAddr, prefix_len: u8) -> Vec<u8> {
 
 pub enum Response {
     A(Vec<Ipv4Addr>),
-    Aaaa,
+    Aaaa(Vec<IpAddr>),
     Cname(String),
 }
 
@@ -163,25 +129,9 @@ fn u16_be(data: &[u8], offset: usize) -> u16 {
     u16::from_be_bytes([data[offset], data[offset + 1]])
 }
 
-fn skip_name(data: &[u8], mut offset: usize) -> Result<usize> {
-    loop {
-        if offset >= data.len() {
-            bail!("name extends past end of packet");
-        }
-        let len = data[offset];
-        if len == 0 {
-            return Ok(offset + 1);
-        }
-        if len & 0xC0 == 0xC0 {
-            return Ok(offset + 2);
-        }
-        offset += 1 + len as usize;
-    }
-}
-
-/// Read a domain name at any offset, handling DNS name compression.
+/// Parse a domain name from DNS packet data at the given offset, handling compression.
 /// Returns (name, offset_after_name).
-pub fn read_domain_name(data: &[u8], mut offset: usize) -> Result<(String, usize)> {
+fn parse_name(data: &[u8], mut offset: usize) -> Result<(String, usize)> {
     let mut labels = Vec::new();
     let mut jumped = false;
     let mut end_offset = offset;
@@ -218,6 +168,30 @@ pub fn read_domain_name(data: &[u8], mut offset: usize) -> Result<(String, usize
     }
 
     Ok((labels.join("."), end_offset))
+}
+
+/// Skip a domain name in DNS packet data (for skipping without parsing).
+/// Returns offset after the name.
+fn skip_name(data: &[u8], mut offset: usize) -> Result<usize> {
+    loop {
+        if offset >= data.len() {
+            bail!("name extends past end of packet");
+        }
+        let len = data[offset];
+        if len == 0 {
+            return Ok(offset + 1);
+        }
+        if len & 0xC0 == 0xC0 {
+            return Ok(offset + 2);
+        }
+        offset += 1 + len as usize;
+    }
+}
+
+/// Read a domain name at any offset, handling DNS name compression.
+/// Returns (name, offset_after_name).
+pub fn read_domain_name(data: &[u8], offset: usize) -> Result<(String, usize)> {
+    parse_name(data, offset)
 }
 
 /// Copy a section of DNS resource records, decompressing owner names and
@@ -269,6 +243,7 @@ pub fn build_cname_chase_response(
 
     let qdcount = u16_be(query, 4);
 
+    // Extract question section from query
     let mut offset = 12;
     for _ in 0..qdcount {
         offset = skip_name(query, offset)?;
@@ -276,32 +251,21 @@ pub fn build_cname_chase_response(
     }
     let question = &query[12..offset];
 
-    let src_qdcount = u16_be(source_response, 4);
+    // Parse source response sections
     let src_ancount = u16_be(source_response, 6);
     let src_nscount = u16_be(source_response, 8);
     let src_arcount = u16_be(source_response, 10);
 
-    let mut src_off = 12;
-    for _ in 0..src_qdcount {
-        src_off = skip_name(source_response, src_off)?;
-        src_off += 4;
-    }
-    let src_answers_start = src_off;
-
-    for _ in 0..src_ancount {
-        src_off = skip_name(source_response, src_off)?;
-        src_off += 10 + u16_be(source_response, src_off + 8) as usize;
-    }
-    let src_ns_start = src_off;
-
-    for _ in 0..src_nscount {
-        src_off = skip_name(source_response, src_off)?;
-        src_off += 10 + u16_be(source_response, src_off + 8) as usize;
-    }
-    let src_additional_start = src_off;
+    let (src_answers_start, src_ns_start, src_additional_start) = 
+        parse_response_sections(source_response)?;
 
     let extra_a_count = if src_ancount == 0
         && let Response::A(ips) = response
+        && !ips.is_empty()
+    {
+        ips.len()
+    } else if src_ancount == 0
+        && let Response::Aaaa(ips) = response
         && !ips.is_empty()
     {
         ips.len()
@@ -311,56 +275,132 @@ pub fn build_cname_chase_response(
     let total_ancount = cname_chain.len() as u16 + src_ancount + extra_a_count as u16;
 
     let rcode = source_response[3] & 0x0F;
+    let qname = QueryInfo::parse(query)?.qname;
 
     let cap =
         12 + question.len() + cname_chain.len() * 64 + (source_response.len() - src_answers_start);
 
-    let qname = QueryInfo::parse(query)?.qname;
-
     let mut buf = Vec::with_capacity(cap);
-    buf.extend_from_slice(&query[..2]);
-    buf.push(0x80 | (query[2] & 0x01));
-    buf.push(0x80 | rcode);
-    buf.extend_from_slice(&qdcount.to_be_bytes());
-    buf.extend_from_slice(&total_ancount.to_be_bytes());
-    buf.extend_from_slice(&src_nscount.to_be_bytes());
-    buf.extend_from_slice(&src_arcount.to_be_bytes());
+    
+    // Build header
+    build_response_header(&mut buf, &query[..2], qdcount, total_ancount, src_nscount, src_arcount, rcode, query[2] & 0x01);
+    
+    // Copy question section
     buf.extend_from_slice(question);
 
+    // Write CNAME chain
     let mut current_name = qname;
-    for (target, ttl) in cname_chain {
-        let name_encoded = encode_domain_to_labels(&current_name);
-        let target_encoded = encode_domain_to_labels(target);
-        buf.extend_from_slice(&name_encoded);
-        buf.extend_from_slice(&DNS_TYPE_CNAME.to_be_bytes());
-        buf.extend_from_slice(&DNS_CLASS_IN.to_be_bytes());
-        buf.extend_from_slice(&ttl.to_be_bytes());
-        buf.extend_from_slice(&(target_encoded.len() as u16).to_be_bytes());
-        buf.extend_from_slice(&target_encoded);
+    for (target, cname_ttl) in cname_chain {
+        write_cname_record(&mut buf, &current_name, target, *cname_ttl);
         current_name = target.clone();
     }
 
+    // Write answer section
     if src_ancount == 0
         && let Response::A(ips) = response
         && !ips.is_empty()
     {
-        for ip in ips {
-            let name_encoded = encode_domain_to_labels(&current_name);
-            buf.extend_from_slice(&name_encoded);
-            buf.extend_from_slice(&DNS_TYPE_A.to_be_bytes());
-            buf.extend_from_slice(&DNS_CLASS_IN.to_be_bytes());
-            buf.extend_from_slice(&ttl.to_be_bytes());
-            buf.extend_from_slice(&4u16.to_be_bytes());
-            buf.extend_from_slice(ip.octets().as_slice());
-        }
+        write_a_records(&mut buf, &current_name, ips, ttl);
+    } else if src_ancount == 0
+        && let Response::Aaaa(ips) = response
+        && !ips.is_empty()
+    {
+        write_aaaa_records(&mut buf, &current_name, ips, ttl);
     } else {
         copy_rr_section(&mut buf, source_response, src_answers_start, src_ancount)?;
     }
 
+    // Copy authority and additional sections
     copy_rr_section(&mut buf, source_response, src_ns_start, src_nscount)?;
     copy_rr_section(&mut buf, source_response, src_additional_start, src_arcount)?;
 
     Ok(buf)
+}
+
+/// Parse response sections and return (answers_start, ns_start, additional_start)
+fn parse_response_sections(data: &[u8]) -> Result<(usize, usize, usize)> {
+    let qdcount = u16_be(data, 4);
+    let mut off = 12;
+    for _ in 0..qdcount {
+        off = skip_name(data, off)?;
+        off += 4;
+    }
+    let answers_start = off;
+    
+    let ancount = u16_be(data, 6);
+    for _ in 0..ancount {
+        off = skip_name(data, off)?;
+        off += 10 + u16_be(data, off + 8) as usize;
+    }
+    let ns_start = off;
+    
+    let nscount = u16_be(data, 8);
+    for _ in 0..nscount {
+        off = skip_name(data, off)?;
+        off += 10 + u16_be(data, off + 8) as usize;
+    }
+    let additional_start = off;
+    
+    Ok((answers_start, ns_start, additional_start))
+}
+
+/// Build DNS response header
+fn build_response_header(
+    buf: &mut Vec<u8>,
+    query_id: &[u8],
+    qdcount: u16,
+    ancount: u16,
+    nscount: u16,
+    arcount: u16,
+    rcode: u8,
+    rd_bit: u8,
+) {
+    buf.extend_from_slice(query_id);
+    buf.push(0x80 | rd_bit); // QR=1, RD from query
+    buf.push(0x80 | rcode);  // RA=1, RCODE
+    buf.extend_from_slice(&qdcount.to_be_bytes());
+    buf.extend_from_slice(&ancount.to_be_bytes());
+    buf.extend_from_slice(&nscount.to_be_bytes());
+    buf.extend_from_slice(&arcount.to_be_bytes());
+}
+
+/// Write a CNAME record to the buffer
+fn write_cname_record(buf: &mut Vec<u8>, name: &str, target: &str, ttl: u32) {
+    let name_encoded = encode_domain_to_labels(name);
+    let target_encoded = encode_domain_to_labels(target);
+    buf.extend_from_slice(&name_encoded);
+    buf.extend_from_slice(&DNS_TYPE_CNAME.to_be_bytes());
+    buf.extend_from_slice(&DNS_CLASS_IN.to_be_bytes());
+    buf.extend_from_slice(&ttl.to_be_bytes());
+    buf.extend_from_slice(&(target_encoded.len() as u16).to_be_bytes());
+    buf.extend_from_slice(&target_encoded);
+}
+
+/// Write A records to the buffer
+fn write_a_records(buf: &mut Vec<u8>, name: &str, ips: &[Ipv4Addr], ttl: u32) {
+    for ip in ips {
+        let name_encoded = encode_domain_to_labels(name);
+        buf.extend_from_slice(&name_encoded);
+        buf.extend_from_slice(&DNS_TYPE_A.to_be_bytes());
+        buf.extend_from_slice(&DNS_CLASS_IN.to_be_bytes());
+        buf.extend_from_slice(&ttl.to_be_bytes());
+        buf.extend_from_slice(&4u16.to_be_bytes());
+        buf.extend_from_slice(ip.octets().as_slice());
+    }
+}
+
+/// Write AAAA records to the buffer
+fn write_aaaa_records(buf: &mut Vec<u8>, name: &str, ips: &[IpAddr], ttl: u32) {
+    for ip in ips {
+        let IpAddr::V6(ipv6) = ip else { continue };
+        let name_encoded = encode_domain_to_labels(name);
+        buf.extend_from_slice(&name_encoded);
+        buf.extend_from_slice(&DNS_TYPE_AAAA.to_be_bytes());
+        buf.extend_from_slice(&DNS_CLASS_IN.to_be_bytes());
+        buf.extend_from_slice(&ttl.to_be_bytes());
+        buf.extend_from_slice(&16u16.to_be_bytes());
+        buf.extend_from_slice(&ipv6.octets());
+    }
 }
 
 pub fn analyze_response(data: &[u8]) -> Result<(Response, u32)> {
@@ -380,8 +420,8 @@ pub fn analyze_response(data: &[u8]) -> Result<(Response, u32)> {
     let config = config()?;
 
     let mut max_ttl = 0;
-    let mut has_aaaa = false;
     let mut a_records = Vec::new();
+    let mut aaaa_records = Vec::new();
     let mut cname_target = None;
     for _ in 0..ancount {
         offset = skip_name(data, offset)?;
@@ -412,8 +452,9 @@ pub fn analyze_response(data: &[u8]) -> Result<(Response, u32)> {
                 );
                 a_records.push(ip.parse()?);
             }
-            DNS_TYPE_AAAA => {
-                has_aaaa = true;
+            DNS_TYPE_AAAA if rdlength == 16 && rdata_off + 16 <= data.len() => {
+                let octets: [u8; 16] = data[rdata_off..rdata_off + 16].try_into().unwrap();
+                aaaa_records.push(IpAddr::V6(Ipv6Addr::from(octets)));
             }
             DNS_TYPE_CNAME if cname_target.is_none() => {
                 let (target, _) = read_domain_name(data, rdata_off)?;
@@ -425,10 +466,10 @@ pub fn analyze_response(data: &[u8]) -> Result<(Response, u32)> {
         offset = rdata_off + rdlength;
     }
 
-    if !a_records.is_empty() || has_aaaa {
+    if !a_records.is_empty() || !aaaa_records.is_empty() {
         Ok((
-            if has_aaaa {
-                Response::Aaaa
+            if !aaaa_records.is_empty() {
+                Response::Aaaa(aaaa_records)
             } else {
                 Response::A(a_records)
             },

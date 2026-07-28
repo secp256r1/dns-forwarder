@@ -142,7 +142,7 @@ async fn resolve_with_cname_chase(
 
     let (resp, ttl) = analyze_response(&response)?;
     match resp {
-        x @ (Response::A(_) | Response::Aaaa) => {
+        x @ (Response::A(_) | Response::Aaaa(_)) => {
             let final_response = if cname_chain.is_empty() {
                 response
             } else {

@@ -54,4 +54,30 @@ impl<V> DomainTrie<V> {
         }
         last_match
     }
+
+    /// Iterate over all entries in the trie, calling `f(domain, value)` for each.
+    /// The domain is reconstructed from the path.
+    pub fn iter<F>(&self, mut f: F)
+    where
+        F: FnMut(&str, &V),
+    {
+        fn walk<V, F>(
+            node: &DomainTrieNode<V>,
+            labels: &mut Vec<String>,
+            f: &mut F,
+        ) where
+            F: FnMut(&str, &V),
+        {
+            if let Some(value) = &node.value {
+                let domain = labels.iter().rev().cloned().collect::<Vec<String>>().join(".");
+                f(&domain, value);
+            }
+            for (label, child) in &node.children {
+                labels.push(label.as_ref().to_string());
+                walk(child, labels, f);
+                labels.pop();
+            }
+        }
+        walk(&self.root, &mut Vec::new(), &mut f);
+    }
 }
