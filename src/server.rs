@@ -9,7 +9,7 @@ use tokio::net::UdpSocket;
 
 use crate::{
     cache,
-    config::{ClientSubnet, NftSet, config},
+    config::{ClientSubnet, NftSet, config, family_to_nfproto},
     dns::{
         QueryInfo, Response, analyze_response, build_a_response, build_cname_chase_response,
         build_empty_response, cap_response_ttl,
@@ -114,8 +114,7 @@ async fn query_handler(query: &[u8]) -> Result<Vec<u8>> {
             {
                 let qname = info.qname.clone();
                 let records = a_records.clone();
-                tokio::task::spawn_blocking(move || add_to_nft_set(&qname, &set, &records))
-                    .await??;
+                add_to_nft_set(&qname, &set, &records).await?;
             }
 
             let r = &r[2..];
@@ -186,8 +185,10 @@ async fn query_from_upstream(
     forwarder::get(upstream).await?.forward(query, qname).await
 }
 
-fn add_to_nft_set(qname: &str, s: &NftSet, ips: &[Ipv4Addr]) -> Result<()> {
-    let ips: Vec<_> = ips.iter().filter(|ip| !s.contains(ip)).collect();
+async fn add_to_nft_set(qname: &str, s: &NftSet, ips: &[Ipv4Addr]) -> Result<()> {
+    use nft_set_elem::nl;
+
+    let ips: Vec<_> = ips.iter().filter(|ip| !s.contains(ip)).copied().collect();
 
     if ips.is_empty() {
         debug!(
@@ -197,33 +198,27 @@ fn add_to_nft_set(qname: &str, s: &NftSet, ips: &[Ipv4Addr]) -> Result<()> {
         return Ok(());
     }
 
-    let elements = ips
+    let family_num = family_to_nfproto(&s.family)?;
+
+    // Collect octets so we can borrow them as &[u8] for AddElem.
+    let octets: Vec<[u8; 4]> = ips.iter().map(Ipv4Addr::octets).collect();
+    let elements: Vec<nl::AddElem<'_>> = octets
         .iter()
-        .map(|ip| ip.to_string())
-        .collect::<Vec<_>>()
-        .join(", ");
+        .map(|o| nl::AddElem {
+            key: o,
+            key_end: None,
+            timeout_ms: None,
+        })
+        .collect();
 
-    let add_out = std::process::Command::new("nft")
-        .arg("add")
-        .arg("element")
-        .arg(&s.family)
-        .arg(&s.table)
-        .arg(&s.set)
-        .arg(format!("{{ {elements} }}"))
-        .output()?;
+    nl::batch_add_set_elements(family_num, &s.table, &s.set, &elements, false)
+        .await
+        .map_err(|e| anyhow!("failed to batch-add IPs to nftables set '{}': {e}", s.set))?;
 
-    if add_out.status.success() {
-        debug!(
-            "added/updated {} IP(s) of {qname} to nftables set '{}'",
-            ips.len(),
-            s.set
-        );
-    } else {
-        warn!(
-            "nft add element '{}' failed: {}",
-            s.set,
-            String::from_utf8_lossy(&add_out.stderr).trim()
-        );
-    }
+    debug!(
+        "added/updated {} IP(s) of {qname} to nftables set '{}'",
+        ips.len(),
+        s.set
+    );
     Ok(())
 }

@@ -18,7 +18,7 @@ async fn main() -> anyhow::Result<()> {
         .ok_or_else(|| anyhow::anyhow!("usage: dns-forwarder <config.toml>"))?;
 
     info!("loading config from {}", config_path.display());
-    config::init(&config_path)?;
+    config::init(&config_path).await?;
 
     extra_domain::init().await;
     cache::init().await?;

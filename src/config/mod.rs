@@ -18,6 +18,7 @@ use serde::Deserialize;
 use crate::trie::DomainTrie;
 
 pub mod nft;
+pub(crate) use nft::family_to_nfproto;
 
 const PRIVATE_DOMAINS: &[&str] = &["lan", "local", "home.arpa", "corp", "internal"];
 
@@ -79,30 +80,17 @@ pub struct NftSet {
     pub family: String,
     pub table: String,
     pub set: String,
-    pub existing_elements: Vec<NftElement>,
+    pub existing_elements: Vec<nft_set_elem::nl::Elem>,
+    pub is_interval: bool,
 }
 
 impl NftSet {
     pub fn contains(&self, ip: &Ipv4Addr) -> bool {
-        self.existing_elements
-            .iter()
-            .find(|i| i.contains(ip))
-            .is_some()
-    }
-}
-
-#[derive(Clone, Debug)]
-pub enum NftElement {
-    Value(Ipv4Addr),
-    Interval { start: Ipv4Addr, end: Ipv4Addr },
-}
-
-impl NftElement {
-    pub fn contains(&self, ip: &Ipv4Addr) -> bool {
-        match self {
-            NftElement::Value(v) => v == ip,
-            NftElement::Interval { start, end } => ip >= start && ip <= end,
-        }
+        nft_set_elem::nl::set_contains_ip(
+            &self.existing_elements,
+            self.is_interval,
+            &ip.octets(),
+        )
     }
 }
 
@@ -147,7 +135,7 @@ pub struct Config {
 }
 
 impl Config {
-    pub fn from_file(path: &Path) -> Result<Self> {
+    pub async fn from_file(path: &Path) -> Result<Self> {
         let config = RawConfig::from_file(path)?;
         let base_dir = path.parent().unwrap_or(Path::new("."));
 
@@ -204,8 +192,8 @@ impl Config {
                             let family = parts[0].to_string();
                             let table = parts[1].to_string();
                             let set = parts[2].to_string();
-                            let existing_elements =
-                                nft::fetch_existing_nft_elements(&family, &table, &set)?;
+                            let (existing_elements, is_interval) =
+                                nft::fetch_existing_nft_elements(&family, &table, &set).await?;
                             if !existing_elements.is_empty() {
                                 info!(
                                     "loaded {} existing nftables elements for set '{}'",
@@ -218,6 +206,7 @@ impl Config {
                                 table,
                                 set,
                                 existing_elements,
+                                is_interval,
                             })
                         }
                         None => None,
@@ -345,8 +334,8 @@ fn read_domain_file(path: &Path, kind: DomainFileKind) -> Result<Vec<DomainFileI
     Ok(result)
 }
 
-pub fn init(path: &Path) -> Result<()> {
-    let config = Config::from_file(path)?;
+pub async fn init(path: &Path) -> Result<()> {
+    let config = Config::from_file(path).await?;
     CONFIG.get_or_init(|| config);
 
     Ok(())

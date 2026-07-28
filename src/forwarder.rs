@@ -1,8 +1,4 @@
-use std::{
-    collections::HashMap,
-    net::SocketAddr,
-    sync::Arc,
-};
+use std::{collections::HashMap, net::SocketAddr, sync::Arc};
 
 use anyhow::{Result, bail};
 use log::{error, warn};
@@ -69,7 +65,12 @@ pub async fn get(remote_addr: &SocketAddr) -> Result<Forwarder> {
     }
 
     let remote_addr = *remote_addr;
-    let socket = UdpSocket::bind("0.0.0.0:0").await?;
+    let bind_addr = if remote_addr.is_ipv6() {
+        "[::]:0"
+    } else {
+        "0.0.0.0:0"
+    };
+    let socket = UdpSocket::bind(bind_addr).await?;
     socket.connect(remote_addr).await?;
     let socket = Arc::new(socket);
     let waiters: WaiterMap = Arc::new(RwLock::new(HashMap::new()));
@@ -92,7 +93,9 @@ pub async fn get(remote_addr: &SocketAddr) -> Result<Forwarder> {
                     if let Some(tx) = recv_waiters.write().await.remove(&query_id)
                         && tx.send(buf[..len].to_vec()).is_err()
                     {
-                        warn!("response from {remote_addr} for 0x{query_id:04x} arrived after caller dropped");
+                        warn!(
+                            "response from {remote_addr} for 0x{query_id:04x} arrived after caller dropped"
+                        );
                     }
                 }
                 Err(e) => {
