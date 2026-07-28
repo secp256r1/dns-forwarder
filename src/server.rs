@@ -137,8 +137,8 @@ async fn resolve_with_cname_chase(
         bail!("CNAME resolution exceeded max depth of 10");
     }
 
-    let current_query = info.build(fastrand::u16(..), ecs);
-    let response = query_from_upstream(&info.qname, &current_query, upstreams).await?;
+    let current_query = info.build(0, ecs);
+    let response = query_from_upstream(&info.qname, current_query, upstreams).await?;
 
     let (resp, ttl) = analyze_response(&response)?;
     match resp {
@@ -177,7 +177,7 @@ async fn resolve_with_cname_chase(
 
 async fn query_from_upstream(
     qname: &str,
-    query: &[u8],
+    query: Vec<u8>,
     upstreams: &[SocketAddr],
 ) -> Result<Vec<u8>> {
     let upstream = fastrand::choice(upstreams).ok_or_else(|| anyhow!("invalid upstreams"))?;

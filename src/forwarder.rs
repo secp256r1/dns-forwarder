@@ -1,4 +1,9 @@
-use std::{collections::HashMap, net::SocketAddr, sync::Arc};
+use std::{
+    collections::HashMap,
+    net::SocketAddr,
+    sync::atomic::{AtomicU16, Ordering},
+    sync::Arc,
+};
 
 use anyhow::{Result, bail};
 use log::{error, warn};
@@ -14,23 +19,34 @@ const FORWARD_TIMEOUT: Duration = Duration::from_secs(5);
 
 static FORWARDER: OnceCell<Arc<RwLock<HashMap<SocketAddr, Forwarder>>>> = OnceCell::const_new();
 
-#[derive(Clone)]
 pub struct Forwarder {
     socket: Arc<UdpSocket>,
     waiters: WaiterMap,
+    next_id: Arc<AtomicU16>,
+}
+
+impl Clone for Forwarder {
+    fn clone(&self) -> Self {
+        Forwarder {
+            socket: self.socket.clone(),
+            waiters: self.waiters.clone(),
+            next_id: self.next_id.clone(),
+        }
+    }
 }
 
 impl Forwarder {
-    pub async fn forward(&self, query: &[u8], qname: &str) -> Result<Vec<u8>> {
+    pub async fn forward(&self, mut query: Vec<u8>, qname: &str) -> Result<Vec<u8>> {
         if query.len() < 2 {
             bail!("query too short");
         }
-        let query_id = u16::from_be_bytes([query[0], query[1]]);
+        let query_id = self.next_id.fetch_add(1, Ordering::Relaxed);
+        query[..2].copy_from_slice(&query_id.to_be_bytes());
 
         let (tx, rx) = oneshot::channel();
         self.waiters.write().await.insert(query_id, tx);
 
-        if let Err(e) = self.socket.send(query).await {
+        if let Err(e) = self.socket.send(&query).await {
             self.waiters.write().await.remove(&query_id);
             bail!("send query {qname} to upstream error: {e}");
         }
@@ -57,6 +73,7 @@ pub async fn get(remote_addr: &SocketAddr) -> Result<Forwarder> {
         bail!("forwarder not initialized");
     };
 
+    // Fast path: read lock
     {
         let read_guard = forwarder.read().await;
         if let Some(f) = read_guard.get(remote_addr) {
@@ -64,7 +81,13 @@ pub async fn get(remote_addr: &SocketAddr) -> Result<Forwarder> {
         }
     }
 
+    // Slow path: write lock with double-check to prevent TOCTOU race
     let remote_addr = *remote_addr;
+    let mut write_guard = forwarder.write().await;
+    if let Some(f) = write_guard.get(&remote_addr) {
+        return Ok(f.clone());
+    }
+
     let bind_addr = if remote_addr.is_ipv6() {
         "[::]:0"
     } else {
@@ -114,12 +137,9 @@ pub async fn get(remote_addr: &SocketAddr) -> Result<Forwarder> {
     let new_forwarder = Forwarder {
         socket: socket.clone(),
         waiters: waiters.clone(),
+        next_id: Arc::new(AtomicU16::new(1)),
     };
 
-    forwarder
-        .write()
-        .await
-        .insert(remote_addr, new_forwarder.clone());
-
+    write_guard.insert(remote_addr, new_forwarder.clone());
     Ok(new_forwarder)
 }
