@@ -283,7 +283,15 @@ pub fn build_cname_chase_response(
     let mut buf = Vec::with_capacity(cap);
     
     // Build header
-    build_response_header(&mut buf, &query[..2], qdcount, total_ancount, src_nscount, src_arcount, rcode, query[2] & 0x01);
+    ResponseHeader {
+        qdcount,
+        ancount: total_ancount,
+        nscount: src_nscount,
+        arcount: src_arcount,
+        rcode,
+        rd_bit: query[2] & 0x01,
+    }
+    .write(&mut buf, &query[..2]);
     
     // Copy question section
     buf.extend_from_slice(question);
@@ -344,24 +352,27 @@ fn parse_response_sections(data: &[u8]) -> Result<(usize, usize, usize)> {
     Ok((answers_start, ns_start, additional_start))
 }
 
-/// Build DNS response header
-fn build_response_header(
-    buf: &mut Vec<u8>,
-    query_id: &[u8],
+/// DNS response header fields.
+struct ResponseHeader {
     qdcount: u16,
     ancount: u16,
     nscount: u16,
     arcount: u16,
     rcode: u8,
     rd_bit: u8,
-) {
-    buf.extend_from_slice(query_id);
-    buf.push(0x80 | rd_bit); // QR=1, RD from query
-    buf.push(0x80 | rcode);  // RA=1, RCODE
-    buf.extend_from_slice(&qdcount.to_be_bytes());
-    buf.extend_from_slice(&ancount.to_be_bytes());
-    buf.extend_from_slice(&nscount.to_be_bytes());
-    buf.extend_from_slice(&arcount.to_be_bytes());
+}
+
+impl ResponseHeader {
+    /// Serialize the header into `buf` prefixed with `query_id`.
+    fn write(&self, buf: &mut Vec<u8>, query_id: &[u8]) {
+        buf.extend_from_slice(query_id);
+        buf.push(0x80 | self.rd_bit); // QR=1, RD from query
+        buf.push(0x80 | self.rcode);  // RA=1, RCODE
+        buf.extend_from_slice(&self.qdcount.to_be_bytes());
+        buf.extend_from_slice(&self.ancount.to_be_bytes());
+        buf.extend_from_slice(&self.nscount.to_be_bytes());
+        buf.extend_from_slice(&self.arcount.to_be_bytes());
+    }
 }
 
 /// Write a CNAME record to the buffer

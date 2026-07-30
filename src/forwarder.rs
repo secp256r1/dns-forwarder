@@ -9,28 +9,35 @@ use anyhow::{Result, bail};
 use log::{error, warn};
 use tokio::{
     net::UdpSocket,
-    sync::{OnceCell, RwLock, oneshot},
+    sync::{Mutex, mpsc, oneshot},
     time::{Duration, timeout},
 };
 
-type WaiterMap = Arc<RwLock<HashMap<u16, oneshot::Sender<Vec<u8>>>>>;
-
 const FORWARD_TIMEOUT: Duration = Duration::from_secs(5);
 
-static FORWARDER: OnceCell<Arc<RwLock<HashMap<SocketAddr, Forwarder>>>> = OnceCell::const_new();
+/// Messages from `forward()` callers to the per-upstream receiver task.
+/// The receiver task owns the pending-response map privately, so routing
+/// an upstream response (the hot path) never takes any cross-task lock.
+enum Command {
+    Register(u16, oneshot::Sender<Vec<u8>>),
+    Cancel(u16),
+}
+
+static FORWARDER: tokio::sync::OnceCell<Arc<Mutex<HashMap<SocketAddr, Forwarder>>>> =
+    tokio::sync::OnceCell::const_new();
 
 pub struct Forwarder {
     socket: Arc<UdpSocket>,
-    waiters: WaiterMap,
     next_id: Arc<AtomicU16>,
+    cmd_tx: mpsc::UnboundedSender<Command>,
 }
 
 impl Clone for Forwarder {
     fn clone(&self) -> Self {
         Forwarder {
             socket: self.socket.clone(),
-            waiters: self.waiters.clone(),
             next_id: self.next_id.clone(),
+            cmd_tx: self.cmd_tx.clone(),
         }
     }
 }
@@ -44,10 +51,14 @@ impl Forwarder {
         query[..2].copy_from_slice(&query_id.to_be_bytes());
 
         let (tx, rx) = oneshot::channel();
-        self.waiters.write().await.insert(query_id, tx);
+        // Register the waiter *before* sending, so a response that lands
+        // between send() and await() is not missed.
+        if self.cmd_tx.send(Command::Register(query_id, tx)).is_err() {
+            bail!("receiver for {qname} closed");
+        }
 
         if let Err(e) = self.socket.send(&query).await {
-            self.waiters.write().await.remove(&query_id);
+            let _ = self.cmd_tx.send(Command::Cancel(query_id));
             bail!("send query {qname} to upstream error: {e}");
         }
 
@@ -55,7 +66,7 @@ impl Forwarder {
             Ok(Ok(result)) => Ok(result),
             Ok(Err(_)) => bail!("get {qname} result cancelled"),
             Err(_) => {
-                self.waiters.write().await.remove(&query_id);
+                let _ = self.cmd_tx.send(Command::Cancel(query_id));
                 bail!("get {qname} result timed out")
             }
         }
@@ -64,82 +75,117 @@ impl Forwarder {
 
 pub async fn init() {
     FORWARDER
-        .get_or_init(|| async { Arc::new(RwLock::new(HashMap::new())) })
+        .get_or_init(|| async { Arc::new(Mutex::new(HashMap::new())) })
         .await;
 }
 
 pub async fn get(remote_addr: &SocketAddr) -> Result<Forwarder> {
-    let Some(forwarder) = FORWARDER.get() else {
+    let Some(table) = FORWARDER.get() else {
         bail!("forwarder not initialized");
     };
 
-    // Fast path: read lock
+    // Fast path: read lock + double-check on the slow path.
     {
-        let read_guard = forwarder.read().await;
-        if let Some(f) = read_guard.get(remote_addr) {
+        if let Some(f) = table.lock().await.get(remote_addr) {
             return Ok(f.clone());
         }
     }
 
-    // Slow path: write lock with double-check to prevent TOCTOU race
     let remote_addr = *remote_addr;
-    let mut write_guard = forwarder.write().await;
-    if let Some(f) = write_guard.get(&remote_addr) {
-        return Ok(f.clone());
-    }
 
     let bind_addr = if remote_addr.is_ipv6() {
         "[::]:0"
     } else {
         "0.0.0.0:0"
     };
-    let socket = UdpSocket::bind(bind_addr).await?;
+    let socket = Arc::new(UdpSocket::bind(bind_addr).await?);
     socket.connect(remote_addr).await?;
-    let socket = Arc::new(socket);
-    let waiters: WaiterMap = Arc::new(RwLock::new(HashMap::new()));
 
-    // Receiver task: reads responses from the upstream and routes them
-    // to the matching forward() caller via the query id. On socket error,
-    // removes this Forwarder from the global map so the next request
-    // recreates the socket (and spawns a fresh receiver).
-    let recv_waiters = waiters.clone();
+    let (cmd_tx, mut cmd_rx) = mpsc::unbounded_channel::<Command>();
+
+    // Receiver task: sole owner of the pending-response map. It concurrently
+    // accepts waiter registrations and routes upstream responses by query id.
+    // On socket error it drops all pending waiters (their forward() calls get
+    // RecvError) and removes this Forwarder from the global map so the next
+    // request recreates the socket and spawns a fresh receiver.
     let recv_socket = socket.clone();
     tokio::task::spawn(async move {
+        let mut waiters: HashMap<u16, oneshot::Sender<Vec<u8>>> = HashMap::new();
         let mut buf = [0u8; 4096];
+
         loop {
-            match recv_socket.recv(&mut buf).await {
-                Ok(len) => {
-                    if len < 2 {
-                        continue;
+            tokio::select! {
+                // Bias toward commands so a cancel racing with an incoming
+                // response still lets us drop the waiter cleanly.
+                biased;
+
+                cmd = cmd_rx.recv() => match cmd {
+                    Some(Command::Register(id, tx)) => {
+                        if waiters.insert(id, tx).is_some() {
+                            // Wrapping u16 means collisions are expected after
+                            // 65535 forwards; the unlucky older waiter is
+                            // dropped and its forward() will get RecvError.
+                            warn!("query id 0x{id:04x} on {remote_addr} reused, dropping previous waiter");
+                        }
                     }
-                    let query_id = u16::from_be_bytes([buf[0], buf[1]]);
-                    if let Some(tx) = recv_waiters.write().await.remove(&query_id)
-                        && tx.send(buf[..len].to_vec()).is_err()
-                    {
-                        warn!(
-                            "response from {remote_addr} for 0x{query_id:04x} arrived after caller dropped"
-                        );
+                    Some(Command::Cancel(id)) => {
+                        waiters.remove(&id);
                     }
-                }
-                Err(e) => {
-                    error!("recv from {remote_addr} error: {e}");
-                    break;
-                }
+                    None => break,
+                },
+
+                recv = recv_socket.recv(&mut buf) => match recv {
+                    Ok(len) => {
+                        if len < 2 {
+                            continue;
+                        }
+                        let query_id = u16::from_be_bytes([buf[0], buf[1]]);
+                        if let Some(tx) = waiters.remove(&query_id)
+                            && tx.send(buf[..len].to_vec()).is_err()
+                        {
+                            warn!(
+                                "response from {remote_addr} for 0x{query_id:04x} \
+                                 arrived after caller dropped"
+                            );
+                        }
+                    }
+                    Err(e) => {
+                        error!("recv from {remote_addr} error: {e}");
+                        break;
+                    }
+                },
             }
         }
+
         // Drop all pending waiters; their forward() calls will get RecvError.
-        recv_waiters.write().await.clear();
-        if let Some(forwarder) = FORWARDER.get() {
-            forwarder.write().await.remove(&remote_addr);
+        waiters.clear();
+
+        // Only remove the entry we created: compare socket identity so we
+        // don't clobber a freshly-rebuilt Forwarder another task created
+        // after our recv error.
+        if let Some(table) = FORWARDER.get() {
+            let mut guard = table.lock().await;
+            if let Some(f) = guard.get(&remote_addr)
+                && Arc::ptr_eq(&f.socket, &recv_socket)
+            {
+                guard.remove(&remote_addr);
+            }
         }
     });
 
     let new_forwarder = Forwarder {
         socket: socket.clone(),
-        waiters: waiters.clone(),
         next_id: Arc::new(AtomicU16::new(1)),
+        cmd_tx,
     };
 
-    write_guard.insert(remote_addr, new_forwarder.clone());
+    // Slow-path insert with double-check to prevent duplicate creation under
+    // concurrent gets for the same upstream. Losing the race just drops the
+    // socket + receiver task we built (the cancel path drops pending waiters).
+    let mut table = table.lock().await;
+    if let Some(existing) = table.get(&remote_addr) {
+        return Ok(existing.clone());
+    }
+    table.insert(remote_addr, new_forwarder.clone());
     Ok(new_forwarder)
 }
